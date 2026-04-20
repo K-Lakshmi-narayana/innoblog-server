@@ -1693,6 +1693,10 @@ app.get(
               title: draft.title || 'Untitled',
               summary: draft.summary || '',
               domain: draft.domain || 'General',
+              body: draft.body || '',
+              tags: draft.tags || [],
+              coverImage: draft.coverImage || '',
+              coverLabel: draft.coverLabel || '',
               createdAt: draft.createdAt || new Date(),
             },
             author: {
