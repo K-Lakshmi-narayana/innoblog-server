@@ -490,7 +490,20 @@ async function migrateLegacyDraftArticles() {
 
 app.use(
   cors({
-    origin: true,
+    origin: function (origin, callback) {
+      const allowedOrigins = [
+        'http://localhost:5173',
+        'http://localhost:3000',
+        'https://innoblog.vercel.app',
+        process.env.FRONTEND_URL,
+      ].filter(Boolean)
+      
+      if (!origin || allowedOrigins.includes(origin)) {
+        callback(null, true)
+      } else {
+        callback(new Error('Not allowed by CORS'))
+      }
+    },
     credentials: true,
   }),
 )
@@ -591,7 +604,7 @@ app.post(
       maxAge: 15 * 24 * 60 * 60 * 1000,
       httpOnly: true,
       secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
+      sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
       path: '/',
     })
 
@@ -608,7 +621,7 @@ app.post(
     response.clearCookie('innoblog_auth', {
       httpOnly: true,
       secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
+      sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
       path: '/',
     })
 
