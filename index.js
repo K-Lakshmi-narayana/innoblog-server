@@ -13,7 +13,7 @@ const User = require('./models/User')
 const VerificationCode = require('./models/VerificationCode')
 const { ensureAdminAccount, ensureProfileForUser, upsertUserByEmail } = require('./services/userService')
 const { buildArticleContent, buildSummary } = require('./utils/articleUtils')
-const { sendEmail, sendOtpEmail } = require('./utils/mail')
+const { sendEmail, sendOtpEmail, sendWriterAccessGrantedEmail, sendWriterAccessRevokedEmail } = require('./utils/mail')
 const PublishRequest = require('./models/PublishRequest')
 const PublicationRequest = require('./models/PublicationRequest')
 const {
@@ -1439,6 +1439,16 @@ app.post(
     const role = email === adminEmail ? 'admin' : 'author'
     const { user, profile } = await upsertUserByEmail(email, { name, role })
 
+    // Send email notification to the user
+    try {
+      if (role === 'author') {
+        await sendWriterAccessGrantedEmail({ to: email, grantedBy: request.user.email })
+      }
+    } catch (emailError) {
+      console.error('Failed to send writer access email:', emailError)
+      // Don't fail the request if email fails
+    }
+
     response.status(201).json({
       user: serializeViewer(user, profile, request.user._id),
       message: `${email} can now publish on InnoBlog.`,
@@ -2057,11 +2067,20 @@ app.delete(
       return
     }
 
+    const userEmail = targetUser.email
     targetUser.role = 'reader'
     await targetUser.save()
 
+    // Send email notification to the user
+    try {
+      await sendWriterAccessRevokedEmail({ to: userEmail })
+    } catch (emailError) {
+      console.error('Failed to send writer access revoked email:', emailError)
+      // Don't fail the request if email fails
+    }
+
     response.json({
-      message: `${targetUser.email} no longer has publishing access on InnoBlog.`,
+      message: `${userEmail} no longer has publishing access on InnoBlog.`,
     })
   }),
 )
