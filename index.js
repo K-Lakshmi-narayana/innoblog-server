@@ -495,16 +495,19 @@ app.use(
         'http://localhost:5173',
         'http://localhost:3000',
         'https://innoblog.vercel.app',
+        'https://innoblog-client.vercel.app',
         process.env.FRONTEND_URL,
       ].filter(Boolean)
       
       if (!origin || allowedOrigins.includes(origin)) {
         callback(null, true)
       } else {
-        callback(new Error('Not allowed by CORS'))
+        callback(null, true) // Allow all origins in production for now
       }
     },
     credentials: true,
+    allowedHeaders: ['Content-Type', 'Authorization'],
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
   }),
 )
 app.use(express.json({ limit: '4mb' }))
