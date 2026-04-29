@@ -9,6 +9,11 @@ function sanitizeHtmlInput(value = '') {
     .replace(/(href|src)=["']javascript:[^"']*["']/gi, '$1="#"')
 }
 
+function stripBase64Images(value = '') {
+  // Remove img tags with data: URLs (base64 images)
+  return value.replace(/<img[^>]+src=["']data:[^"']*["'][^>]*>/gi, '')
+}
+
 function buildArticleContent(value = '') {
   const cleanHtml = sanitizeHtmlInput(value).trim() || '<p>Untitled story.</p>'
   const headingCounts = new Map()
@@ -61,4 +66,5 @@ function buildSummary(value = '', fallbackBody = '') {
 module.exports = {
   buildArticleContent,
   buildSummary,
+  stripBase64Images,
 }
