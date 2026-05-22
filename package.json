@@ -6,7 +6,16 @@
   "scripts": {
     "start": "node index.js",
     "dev": "node index.js",
-    "check": "node --check index.js"
+    "check": "node --check index.js",
+    "test": "jest --colors --verbose",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage",
+    "test:report": "jest --coverage --reporters=default --reporters=jest-html-reporter",
+    "test:smtp:smoke": "node scripts/smtp-smoke.js",
+    "test:coverage:open": "jest --coverage && open coverage/index.html",
+    "test:integration": "jest tests/integration.test.js --verbose",
+    "test:unit": "jest tests/validations.test.js --verbose",
+    "test:ci": "jest --ci --coverage --maxWorkers=2"
   },
   "author": "",
   "license": "ISC",
@@ -15,10 +24,19 @@
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
+    "google-auth-library": "^9.6.0",
     "jsonwebtoken": "^9.0.3",
     "mongoose": "^9.4.1",
     "multer": "^2.1.1",
     "nodemailer": "^8.0.5",
+    "redis": "^5.12.1",
     "uuid": "^13.0.0"
+  },
+  "devDependencies": {
+    "@types/jest": "^30.0.0",
+    "jest": "^30.3.0",
+    "jest-html-reporter": "^4.4.0",
+    "mongodb-memory-server": "^11.1.0",
+    "supertest": "^7.2.2"
   }
 }

@@ -19,7 +19,7 @@ function loadEnv() {
   }
 
   // Optional: validation (VERY IMPORTANT in production)
-  const requiredVars = ["MONGODB_URI", "MAIL_USER", "MAIL_PASS"];
+  const requiredVars = ["MONGODB_URI", "MAIL_USER", "MAIL_PASS", "GOOGLE_CLIENT_ID"];
 
   for (const key of requiredVars) {
     if (!process.env[key]) {

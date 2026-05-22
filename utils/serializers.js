@@ -1,5 +1,8 @@
+const mongoose = require('mongoose')
+
 const Profile = require('../models/Profile')
 const { toDisplayName } = require('./stringUtils')
+const { getProfileBatch, cacheProfileBatch } = require('./cacheService')
 
 function toIdString(value) {
   return value ? value.toString() : ''
@@ -11,14 +14,34 @@ function hasId(list = [], targetId) {
 }
 
 async function buildProfileMap(userIds = []) {
-  const uniqueIds = [...new Set(userIds.map((userId) => toIdString(userId)).filter(Boolean))]
+  const uniqueIds = [
+    ...new Set(
+      userIds
+        .map((userId) => toIdString(userId))
+        .filter((userId) => mongoose.Types.ObjectId.isValid(userId)),
+    ),
+  ]
 
   if (!uniqueIds.length) {
     return new Map()
   }
 
+  // Try to get from cache first
+  const cacheKey = uniqueIds.sort().join(',')
+  let cachedProfiles = await getProfileBatch(uniqueIds)
+  if (cachedProfiles && Object.keys(cachedProfiles).length === uniqueIds.length) {
+    return new Map(Object.entries(cachedProfiles).map(([userId, profile]) => [userId, profile]))
+  }
+
+  // Not in cache or incomplete, fetch from database
   const profiles = await Profile.find({ user: { $in: uniqueIds } }).lean()
-  return new Map(profiles.map((profile) => [toIdString(profile.user), profile]))
+  const profileMap = new Map(profiles.map((profile) => [toIdString(profile.user), profile]))
+  
+  // Cache the result (convert Map to object for Redis serialization)
+  const profileObject = Object.fromEntries(profileMap)
+  await cacheProfileBatch(profileObject, uniqueIds)
+  
+  return profileMap
 }
 
 function serializeProfile(profile, user, viewerId) {

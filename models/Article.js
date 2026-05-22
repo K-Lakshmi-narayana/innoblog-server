@@ -132,4 +132,11 @@ const articleSchema = new mongoose.Schema(
   },
 )
 
+// Compound indexes for common query patterns
+articleSchema.index({ domain: 1, publicationStatus: 1, publishedAt: -1 })
+articleSchema.index({ publicationStatus: 1, publishedAt: -1 })
+articleSchema.index({ author: 1, publicationStatus: 1, publishedAt: -1 })
+articleSchema.index({ isDraft: 1, publicationStatus: 1 })
+articleSchema.index({ isFeatured: 1, publishedAt: -1 })
+
 module.exports = mongoose.models.Article || mongoose.model('Article', articleSchema)

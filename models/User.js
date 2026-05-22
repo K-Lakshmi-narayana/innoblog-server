@@ -24,6 +24,12 @@ const userSchema = new mongoose.Schema(
       type: Date,
       default: null,
     },
+    // OAuth fields
+    googleId: {
+      type: String,
+      default: null,
+      index: true,
+    },
     // Writer-specific fields
     writerAccessGrantedBy: {
       type: mongoose.Schema.Types.ObjectId,

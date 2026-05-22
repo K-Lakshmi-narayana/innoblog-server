@@ -1,8 +1,27 @@
 const cors = require('cors')
 const express = require('express')
 const mongoose = require('mongoose')
+const { OAuth2Client } = require('google-auth-library')
 
 const loadEnv = require('./config/loadEnv')
+const { initializeRedis, getCache, setCache } = require('./utils/cache')
+const {
+  cacheArticleFeed,
+  cacheArticleComments,
+  cacheTopArticles,
+  cacheDomainStats,
+  cacheProfileBatch,
+  getArticleFeed,
+  getArticleComments,
+  getTopArticles,
+  getDomainStats,
+  getProfileBatch,
+  invalidateOnArticleChange,
+  invalidateArticleCommentsCache,
+  invalidateArticleFeedCache,
+  invalidateTopArticlesCache,
+  invalidateProfileCache,
+} = require('./utils/cacheService')
 const { DOMAINS } = require('./constants/domains')
 const { optionalAuth, requireAdmin, requireAuthor, requireAuth, requireAuthorOrAdmin, signAuthToken } = require('./middleware/auth')
 const Article = require('./models/Article')
@@ -31,6 +50,16 @@ const {
   normalizeEmail,
   slugify,
 } = require('./utils/stringUtils')
+const {
+  MAX_ARTICLE_TAG_LENGTH,
+  MAX_ARTICLE_TAGS,
+  MIN_ARTICLE_TAGS,
+  getTagSuggestionsForDomain,
+  getUnknownTags,
+  normalizeTagKey,
+  rankTagSuggestions,
+  resolveTagLabel,
+} = require('./constants/tagSuggestions')
 
 if (process.env.NODE_ENV !== "production") {
   require("dotenv").config();
@@ -42,9 +71,30 @@ const app = express()
 const PORT = Number(process.env.PORT || 4000)
 const OTP_EXPIRY_MINUTES = 10
 
+// Simple cache for domain stats (30 second TTL)
+let domainStatsCache = null
+let domainStatsCacheTime = 0
+const DOMAIN_STATS_CACHE_TTL = 30000 // 30 seconds
+
+class AppError extends Error {
+  constructor(statusCode, message, options = {}) {
+    super(message)
+    this.name = 'AppError'
+    this.statusCode = statusCode || 500
+    this.code = options.code || 'INTERNAL_SERVER_ERROR'
+    this.details = options.details || null
+  }
+}
+
 function asyncHandler(handler) {
   return (request, response, next) => {
     Promise.resolve(handler(request, response, next)).catch(next)
+  }
+}
+
+function ensure(condition, message, statusCode = 400, code = 'BAD_REQUEST', details = null) {
+  if (!condition) {
+    throw new AppError(statusCode, message, { code, details })
   }
 }
 
@@ -52,10 +102,149 @@ function validateEmail(value = '') {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)
 }
 
-function normalizeTags(tags = []) {
+function normalizeTags(tags = [], domain = '') {
   const rawTags = Array.isArray(tags) ? tags : String(tags).split(',')
+  const seenTags = new Set()
+  const normalizedTags = []
 
-  return [...new Set(rawTags.map((tag) => tag.trim()).filter(Boolean))].slice(0, 8)
+  rawTags
+    .map((tag) => String(tag || '').trim().replace(/\s+/g, ' '))
+    .filter(Boolean)
+    .forEach((tag) => {
+      const tagLabel = resolveTagLabel(tag, domain)
+      const tagKey = normalizeTagKey(tagLabel)
+
+      if (!seenTags.has(tagKey)) {
+        seenTags.add(tagKey)
+        normalizedTags.push(tagLabel)
+      }
+    })
+
+  return normalizedTags
+}
+
+function validateArticleInput(input) {
+  const errors = []
+
+  // Title validation: 5-200 chars
+  if (!input.title || !String(input.title).trim()) {
+    errors.push('Title is required.')
+  } else if (input.title.length < 5) {
+    errors.push('Title must be at least 5 characters.')
+  } else if (input.title.length > 200) {
+    errors.push('Title must not exceed 200 characters.')
+  }
+
+  // Summary validation: 10-500 chars
+  if (!input.summary || !String(input.summary).trim()) {
+    errors.push('Summary is required.')
+  } else if (input.summary.length < 10) {
+    errors.push('Summary must be at least 10 characters.')
+  } else if (input.summary.length > 500) {
+    errors.push('Summary must not exceed 500 characters.')
+  }
+
+  // Body validation: min 120 chars
+  if (!input.bodyHtml || !input.bodyHtml.trim()) {
+    errors.push('Article body is required.')
+  } else {
+    // Remove HTML tags to check text content
+    const plainText = input.bodyHtml.replace(/<[^>]*>/g, '').trim()
+    if (plainText.length < 120) {
+      errors.push('Article body must have at least 120 characters of content.')
+    }
+  }
+
+  // Cover label validation: max 100 chars
+  if (input.coverLabel && input.coverLabel.length > 100) {
+    errors.push('Cover label must not exceed 100 characters.')
+  }
+
+  const tags = Array.isArray(input.tags)
+    ? input.tags
+    : String(input.tags || '')
+        .split(',')
+        .map((tag) => tag.trim())
+        .filter(Boolean)
+
+  if (tags.length < MIN_ARTICLE_TAGS) {
+    errors.push(`Select at least ${MIN_ARTICLE_TAGS} tags.`)
+  }
+
+  if (tags.length > MAX_ARTICLE_TAGS) {
+    errors.push(`Maximum ${MAX_ARTICLE_TAGS} tags allowed.`)
+  }
+
+  for (const tag of tags) {
+    if (String(tag).length > MAX_ARTICLE_TAG_LENGTH) {
+      errors.push(`Tag "${tag}" exceeds maximum length of ${MAX_ARTICLE_TAG_LENGTH} characters.`)
+    }
+  }
+
+  const unknownTags = getUnknownTags(tags, input.domain)
+  if (unknownTags.length > 0) {
+    errors.push(`Choose tags from the selected domain list. Remove: ${unknownTags.join(', ')}.`)
+  }
+
+  return errors
+}
+
+function ensureValidArticleInput(input) {
+  const validationErrors = validateArticleInput(input)
+  if (validationErrors.length > 0) {
+    ensure(false, validationErrors[0], 400, 'VALIDATION_ERROR', { validationErrors })
+  }
+}
+
+function validateCommentInput(body) {
+  const errors = []
+
+  if (!body || !String(body).trim()) {
+    errors.push('Comment cannot be empty.')
+  } else if (body.length > 2000) {
+    errors.push('Comment must not exceed 2000 characters.')
+  }
+
+  return errors
+}
+
+function validateProfileInput(profile) {
+  const errors = []
+
+  if (profile.name && String(profile.name).length < 2) {
+    errors.push('Name must be at least 2 characters.')
+  }
+  if (profile.name && String(profile.name).length > 100) {
+    errors.push('Name must not exceed 100 characters.')
+  }
+  if (profile.bio && String(profile.bio).length > 500) {
+    errors.push('Bio must not exceed 500 characters.')
+  }
+  if (profile.handle) {
+    if (String(profile.handle).length < 3) {
+      errors.push('Handle must be at least 3 characters.')
+    } else if (String(profile.handle).length > 30) {
+      errors.push('Handle must not exceed 30 characters.')
+    } else if (!/^[a-z0-9_\-]+$/.test(profile.handle)) {
+      errors.push('Handle can only contain lowercase letters, numbers, underscores, and hyphens.')
+    }
+  }
+
+  return errors
+}
+
+function ensureValidCommentInput(body) {
+  const validationErrors = validateCommentInput(body)
+  if (validationErrors.length > 0) {
+    ensure(false, validationErrors[0], 400, 'VALIDATION_ERROR')
+  }
+}
+
+function ensureValidProfileInput(profile) {
+  const validationErrors = validateProfileInput(profile)
+  if (validationErrors.length > 0) {
+    ensure(false, validationErrors[0], 400, 'VALIDATION_ERROR')
+  }
 }
 
 async function createUniqueArticleSlug(title) {
@@ -239,7 +428,7 @@ function canManageDraft(draft, user) {
 async function fetchArticleCollection(query = {}, viewerId = null, options = {}) {
   const articlesQuery = Article.find(query)
     .sort(options.sort || { publishedAt: -1 })
-    .populate('author')
+    .select('-likedBy -viewCount -toc -bodyHtml')
     .lean()
 
   if (options.skip !== undefined) {
@@ -253,7 +442,7 @@ async function fetchArticleCollection(query = {}, viewerId = null, options = {})
   const articles = await articlesQuery
 
   const profileMap = await buildProfileMap(
-    articles.map((article) => article.author?._id || article.author),
+    articles.map((article) => article.author),
   )
 
   return articles.map((article) =>
@@ -268,7 +457,7 @@ async function fetchArticleCollection(query = {}, viewerId = null, options = {})
 async function fetchDraftCollection(query = {}, viewerId = null, options = {}) {
   const draftsQuery = Draft.find(query)
     .sort(options.sort || { updatedAt: -1 })
-    .populate('author')
+    .select('-likedBy')
     .lean()
 
   if (options.skip !== undefined) {
@@ -281,7 +470,7 @@ async function fetchDraftCollection(query = {}, viewerId = null, options = {}) {
 
   const drafts = await draftsQuery
   const profileMap = await buildProfileMap(
-    drafts.map((draft) => draft.author?._id || draft.author),
+    drafts.map((draft) => draft.author),
   )
 
   return drafts.map((draft) =>
@@ -315,7 +504,7 @@ function buildDraftPayloadFromContent(input, existingDraft = null) {
       domain,
       coverLabel: input.coverLabel?.trim() || domain.toUpperCase(),
       coverImage: input.coverImage?.trim() || '',
-      tags: normalizeTags(input.tags),
+      tags: normalizeTags(input.tags, domain),
       bodyHtml,
       toc,
       readTime,
@@ -328,8 +517,18 @@ async function saveDraftFromRequest(input, user, existingDraft = null) {
   const { data, error } = buildDraftPayloadFromContent(input, existingDraft)
 
   if (error) {
-    throw new Error(error)
+    throw new AppError(400, error, { code: 'VALIDATION_ERROR' })
   }
+
+  // Validate the complete article input with comprehensive checks
+  ensureValidArticleInput({
+    title: data.title,
+    summary: data.summary,
+    bodyHtml: data.bodyHtml,
+    coverLabel: data.coverLabel,
+    domain: data.domain,
+    tags: data.tags,
+  })
 
   const draft = existingDraft || new Draft()
   draft.author = existingDraft?.author || user._id
@@ -619,6 +818,101 @@ app.post(
 )
 
 app.post(
+  '/api/auth/google-login',
+  asyncHandler(async (request, response) => {
+    const { credential } = request.body
+
+    console.log('[Google Auth] Received Google login request')
+
+    if (!credential) {
+      console.error('[Google Auth] No credential provided')
+      response.status(400).json({ message: 'Google credential is required.' })
+      return
+    }
+
+    if (!process.env.GOOGLE_CLIENT_ID) {
+      console.error('[Google Auth] GOOGLE_CLIENT_ID not configured')
+      response.status(500).json({ message: 'Google OAuth is not configured on the server.' })
+      return
+    }
+
+    const client = new OAuth2Client(process.env.GOOGLE_CLIENT_ID)
+
+    let ticket
+    try {
+      console.log('[Google Auth] Verifying ID token')
+      ticket = await client.verifyIdToken({
+        idToken: credential,
+        audience: process.env.GOOGLE_CLIENT_ID,
+      })
+      console.log('[Google Auth] Token verified successfully')
+    } catch (error) {
+      console.error('[Google Auth] Token verification failed:', error.message)
+      response.status(401).json({ message: 'Invalid or expired Google token.' })
+      return
+    }
+
+    const payload = ticket.getPayload()
+    const googleId = payload.sub
+    const email = normalizeEmail(payload.email)
+    const name = payload.name || ''
+
+    console.log('[Google Auth] Processing user:', email)
+
+    // Find or create user with Google ID
+    let user = await User.findOne({ googleId })
+
+    if (!user) {
+      // Check if user exists with same email
+      user = await User.findOne({ email })
+      if (user) {
+        // Link Google ID to existing user
+        console.log('[Google Auth] Linking Google ID to existing user')
+        user.googleId = googleId
+        await user.save()
+      } else {
+        // Create new user
+        console.log('[Google Auth] Creating new user')
+        const adminEmail = normalizeEmail(process.env.ADMIN_EMAIL || process.env.MAIL_USER || '')
+        const requestedRole = email === adminEmail ? 'admin' : 'reader'
+        
+        const result = await upsertUserByEmail(email, {
+          name,
+          role: requestedRole,
+        })
+        user = result.user
+        user.googleId = googleId
+        await user.save()
+      }
+    }
+
+    // Ensure user profile exists
+    const profile = await ensureProfileForUser(user)
+
+    // Update last login time
+    user.lastLoginAt = new Date()
+    await user.save()
+
+    // Generate auth token
+    const token = signAuthToken(user)
+    console.log('[Google Auth] Login successful for:', email)
+
+    response.cookie('innoblog_auth', token, {
+      maxAge: 15 * 24 * 60 * 60 * 1000,
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
+      path: '/',
+    })
+
+    response.json({
+      token,
+      user: serializeViewer(user, profile, user._id, { includeEmail: true }),
+    })
+  }),
+)
+
+app.post(
   '/api/auth/logout',
   asyncHandler(async (request, response) => {
     response.clearCookie('innoblog_auth', {
@@ -647,6 +941,44 @@ app.get(
 )
 
 app.get(
+  '/api/domains/stats',
+  asyncHandler(async (request, response) => {
+    // Check Redis cache first
+    let cachedStats = await getDomainStats()
+    if (cachedStats) {
+      return response.json({ stats: cachedStats })
+    }
+
+    const stats = await Article.aggregate([
+      {
+        $match: buildPublicArticleQuery(),
+      },
+      {
+        $group: {
+          _id: '$domain',
+          count: { $sum: 1 },
+        },
+      },
+      {
+        $sort: { _id: 1 },
+      },
+    ])
+
+    // Convert to expected format and ensure all domains are included
+    const statsMap = Object.fromEntries(stats.map((stat) => [stat._id, stat.count]))
+    const allStats = DOMAINS.map((domain) => ({
+      domain,
+      count: statsMap[domain] || 0,
+    }))
+
+    // Cache the result (30-second TTL)
+    await cacheDomainStats(allStats)
+
+    response.json({ stats: allStats })
+  }),
+)
+
+app.get(
   '/api/articles',
   optionalAuth,
   asyncHandler(async (request, response) => {
@@ -654,6 +986,23 @@ app.get(
     const search = request.query.search?.trim()
     const domain = request.query.domain?.trim()
     const authorHandle = request.query.author?.trim()
+    const page = Math.max(1, Number(request.query.page) || 1)
+    const limit = request.query.limit
+      ? Number(request.query.limit)
+      : request.query.page
+      ? 10
+      : 30
+    const sortParam = String(request.query.sort || 'recent').trim().toLowerCase()
+
+    // Try to get from cache only if no search and no author filter (most common case)
+    const canCache = !search && !authorHandle
+    if (canCache) {
+      const tags = request.query.tags?.trim() || ''
+      const cachedResult = await getArticleFeed(page, limit, domain, sortParam, tags)
+      if (cachedResult) {
+        return response.json(cachedResult)
+      }
+    }
 
     if (domain) {
       if (!DOMAINS.includes(domain)) {
@@ -683,15 +1032,8 @@ app.get(
       ]
     }
 
-    const page = Math.max(1, Number(request.query.page) || 1)
-    const limit = request.query.limit
-      ? Number(request.query.limit)
-      : request.query.page
-      ? 10
-      : 30
     const skip = (page - 1) * limit
 
-    const sortParam = String(request.query.sort || 'recent').trim().toLowerCase()
     let sortOption = { publishedAt: -1 }
 
     if (sortParam === 'top') {
@@ -709,14 +1051,22 @@ app.get(
       limit,
     })
 
-    response.json({
+    const result = {
       articles,
       totalCount,
       page,
       limit,
       totalPages: Math.ceil(totalCount / limit),
       sort: sortParam,
-    })
+    }
+
+    // Cache if applicable
+    if (canCache) {
+      const tags = request.query.tags?.trim() || ''
+      await cacheArticleFeed(result, page, limit, domain, sortParam, tags)
+    }
+
+    response.json(result)
   }),
 )
 
@@ -724,12 +1074,52 @@ app.get(
   '/api/articles/top',
   optionalAuth,
   asyncHandler(async (request, response) => {
+    // Try Redis cache first
+    const cachedTopArticles = await getTopArticles('top', '')
+    if (cachedTopArticles) {
+      return response.json({ articles: cachedTopArticles })
+    }
+
     const articles = await fetchArticleCollection(buildPublicArticleQuery(), request.user?._id, {
       sort: { likeCount: -1, commentCount: -1, publishedAt: -1 },
       limit: 8,
     })
 
+    // Cache top articles (2-minute TTL)
+    await cacheTopArticles(articles, 'top', '')
+
     response.json({ articles })
+  }),
+)
+
+app.get(
+  '/api/tags/suggestions',
+  asyncHandler(async (request, response) => {
+    const domain = String(request.query.domain || '').trim().toLowerCase()
+
+    ensure(domain, 'Domain parameter is required.', 400, 'VALIDATION_ERROR')
+    ensure(DOMAINS.includes(domain), 'Choose a valid article domain.', 400, 'VALIDATION_ERROR')
+
+    const cacheKey = `tags:suggestions:v2:${domain}`
+    const cachedTags = await getCache(cacheKey)
+    if (Array.isArray(cachedTags)) {
+      return response.json({ tags: cachedTags })
+    }
+
+    const articles = await Article.find({
+      domain,
+      publicationStatus: PUBLICATION_STATUS.PUBLISHED,
+    }).select('tags').lean()
+
+    const rankedTags = rankTagSuggestions(
+      domain,
+      articles.map((article) => article.tags || []),
+    )
+    const tags = rankedTags.length ? rankedTags : getTagSuggestionsForDomain(domain)
+
+    await setCache(cacheKey, tags, 900)
+
+    response.json({ tags })
   }),
 )
 
@@ -846,6 +1236,9 @@ app.patch(
         await clearPendingPublicationRequestsForDraft(draft._id)
         await Draft.findByIdAndDelete(draft._id)
 
+        // Invalidate caches when article is published from draft
+        await invalidateOnArticleChange(article._id, article.domain)
+
         const createdArticle = await Article.findById(article._id).populate('author').lean()
         const profileMap = await buildProfileMap([createdArticle.author?._id || createdArticle.author])
 
@@ -916,7 +1309,7 @@ app.get(
   optionalAuth,
   asyncHandler(async (request, response) => {
     const article = await Article.findOne({ slug: request.params.slug })
-      .populate('author')
+      .select('-likedBy')
       .lean()
 
     if (!article || !canViewArticle(article, request.user)) {
@@ -928,29 +1321,31 @@ app.get(
       await Article.findByIdAndUpdate(article._id, { $inc: { viewCount: 1 } })
     }
 
-    const [relatedArticles, comments] = await Promise.all([
-      Article.find(
-        buildPublicArticleQuery({
-          _id: { $ne: article._id },
-          $or: [{ domain: article.domain }, { author: article.author._id }],
-        }),
-      )
-        .sort({ likeCount: -1, publishedAt: -1 })
-        .limit(3)
-        .populate('author')
-        .lean(),
+    const [comments, totalComments, relatedArticles] = await Promise.all([
       Comment.find({ article: article._id })
         .sort({ createdAt: -1 })
-        .limit(20)
-        .populate('author')
+        .limit(10)
+        .select('-__v')
+        .lean(),
+      Comment.countDocuments({ article: article._id }),
+      // Fetch related articles by tags
+      Article.find({
+        _id: { $ne: article._id },
+        publicationStatus: 'published',
+        tags: { $in: article.tags },
+      })
+        .select('-likedBy -bodyHtml')
+        .sort({ viewCount: -1 })
+        .limit(6)
         .lean(),
     ])
 
-    const profileMap = await buildProfileMap([
-      article.author?._id || article.author,
-      ...relatedArticles.map((entry) => entry.author?._id || entry.author),
-      ...comments.map((entry) => entry.author?._id || entry.author),
-    ])
+    const allUserIds = [
+      article.author,
+      ...comments.map((entry) => entry.author),
+      ...relatedArticles.map((entry) => entry.author),
+    ].filter((id) => id)
+    const profileMap = await buildProfileMap(allUserIds)
 
     response.json({
       article: serializeArticle(article, {
@@ -970,7 +1365,67 @@ app.get(
           viewerId: request.user?._id,
         }),
       ),
+      totalComments,
     })
+  }),
+)
+
+app.get(
+  '/api/articles/:id/comments',
+  optionalAuth,
+  asyncHandler(async (request, response) => {
+    const article = await Article.findById(request.params.id).lean()
+
+    if (!article) {
+      response.status(404).json({ message: 'Article not found.' })
+      return
+    }
+
+    const page = Math.max(1, Number(request.query.page) || 1)
+    const limit = Math.min(50, Math.max(1, Number(request.query.limit) || 10))
+    const skip = (page - 1) * limit
+
+    // Try cache first for public articles
+    if (isArticlePubliclyVisible(article)) {
+      const cachedComments = await getArticleComments(request.params.id, page, limit)
+      if (cachedComments) {
+        return response.json(cachedComments)
+      }
+    }
+
+    const [comments, totalComments] = await Promise.all([
+      Comment.find({ article: article._id })
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .select('-__v')
+        .lean(),
+      Comment.countDocuments({ article: article._id }),
+    ])
+
+    const profileMap = await buildProfileMap(
+      comments.map((entry) => entry.author),
+    )
+
+    const result = {
+      comments: comments.map((entry) =>
+        serializeComment(entry, {
+          profileMap,
+          viewerId: request.user?._id,
+        }),
+      ),
+      totalComments,
+      page,
+      limit,
+      totalPages: Math.ceil(totalComments / limit),
+    }
+
+    // Cache result for public articles
+    if (isArticlePubliclyVisible(article)) {
+      await cacheArticleComments(result, request.params.id, page, limit)
+    }
+
+    response.json(result)
   }),
 )
 
@@ -1001,15 +1456,26 @@ app.post(
     }
 
     const { bodyHtml, toc, readTime, plainText } = buildArticleContent(body)
+    const summary = buildSummary(request.body.summary || '', plainText)
+
+    ensureValidArticleInput({
+      title,
+      summary,
+      bodyHtml,
+      coverLabel: request.body.coverLabel?.trim() || domain.toUpperCase(),
+      tags: normalizeTags(request.body.tags, domain),
+      domain,
+    })
+
     const article = await Article.create({
       author: request.user._id,
       title,
       slug: await createUniqueArticleSlug(title),
-      summary: buildSummary(request.body.summary || '', plainText),
+      summary,
       domain,
       coverLabel: request.body.coverLabel?.trim() || domain.toUpperCase(),
       coverImage: request.body.coverImage?.trim() || '',
-      tags: normalizeTags(request.body.tags),
+      tags: normalizeTags(request.body.tags, domain),
       bodyHtml,
       toc,
       publishedAt: new Date(),
@@ -1027,6 +1493,9 @@ app.post(
 
     const createdArticle = await Article.findById(article._id).populate('author').lean()
     const profileMap = await buildProfileMap([request.user._id])
+
+    // Invalidate caches when new article is published
+    await invalidateOnArticleChange(article._id, domain)
 
     response.status(201).json({
       article: serializeArticle(createdArticle, {
@@ -1089,10 +1558,8 @@ app.post(
       return
     }
 
-    if (!body) {
-      response.status(400).json({ message: 'Comment text is required.' })
-      return
-    }
+    // Validate comment input
+    ensureValidCommentInput(body)
 
     const comment = await Comment.create({
       article: article._id,
@@ -1102,6 +1569,9 @@ app.post(
 
     article.commentCount += 1
     await article.save()
+
+    // Invalidate comment cache for this article
+    await invalidateArticleCommentsCache(article._id)
 
     const createdComment = await Comment.findById(comment._id).populate('author').lean()
     const profileMap = await buildProfileMap([request.user._id])
@@ -1157,9 +1627,19 @@ app.patch(
     article.domain = domainUpdate
     article.coverLabel = request.body.coverLabel?.trim() || domainUpdate.toUpperCase()
     article.coverImage = request.body.coverImage?.trim() || ''
-    article.tags = normalizeTags(request.body.tags)
+    article.tags = normalizeTags(request.body.tags, domainUpdate)
 
     const { bodyHtml, toc, readTime, plainText } = buildArticleContent(bodyUpdate)
+
+    ensureValidArticleInput({
+      title: titleUpdate,
+      summary: buildSummary(request.body.summary || '', plainText),
+      bodyHtml,
+      coverLabel: request.body.coverLabel?.trim() || domainUpdate.toUpperCase(),
+      domain: domainUpdate,
+      tags: normalizeTags(request.body.tags, domainUpdate),
+    })
+
     article.bodyHtml = bodyHtml
     article.toc = toc
     article.readTime = readTime
@@ -1193,6 +1673,9 @@ app.patch(
     if (shouldClearPendingRequests) {
       await clearPendingPublicationRequests(article._id)
     }
+
+    // Invalidate caches when article is modified
+    await invalidateOnArticleChange(article._id, article.domain)
 
     const updatedArticle = await Article.findById(article._id).populate('author').lean()
     const profileMap = await buildProfileMap([request.user._id])
@@ -1228,7 +1711,11 @@ app.delete(
 
     await Comment.deleteMany({ article: article._id })
     await PublicationRequest.deleteMany({ article: article._id })
+    
+    // Invalidate caches when article is deleted
+    const domain = article.domain
     await Article.findByIdAndDelete(article._id)
+    await invalidateOnArticleChange(article._id, domain)
 
     response.json({ message: 'Article deleted successfully.' })
   }),
@@ -1264,6 +1751,9 @@ app.delete(
     await Comment.findByIdAndDelete(comment._id)
     article.commentCount = Math.max(0, article.commentCount - 1)
     await article.save()
+
+    // Invalidate comment cache for this article
+    await invalidateArticleCommentsCache(article._id)
 
     response.json({ message: 'Comment deleted successfully.' })
   }),
@@ -1304,6 +1794,13 @@ app.patch(
   '/api/profiles/me',
   requireAuth,
   asyncHandler(async (request, response) => {
+    // Validate profile input
+    ensureValidProfileInput({
+      name: request.body.displayName,
+      bio: request.body.bio,
+      handle: request.body.handle,
+    })
+
     const profile = await ensureProfileForUser(request.user, {
       displayName: request.body.displayName,
       headline: request.body.headline,
@@ -1776,6 +2273,9 @@ app.post(
     await clearPendingPublicationRequestsForDraft(draft._id)
     await Draft.findByIdAndDelete(draft._id)
 
+    // Invalidate caches when article is published from draft
+    await invalidateOnArticleChange(article._id, article.domain)
+
     // Send email notification to author
     if (process.env.MAIL_USER && process.env.MAIL_PASS) {
       await sendEmail({
@@ -2085,8 +2585,12 @@ app.delete(
   }),
 )
 
+app.get('/api/test', (request, response) => {
+  response.json({ test: 'ok', tags: 'endpoint' })
+})
+
 app.use((request, response) => {
-  response.status(404).json({ message: 'Route not found.' })
+  response.status(404).json({ message: 'Route not found. TEST MESSAGE 12345' })
 })
 
 app.use((error, request, response, next) => {
@@ -2096,8 +2600,43 @@ app.use((error, request, response, next) => {
   }
 
   console.error(error)
-  response.status(500).json({
+  
+  // Handle Mongoose validation errors
+  if (error.name === 'ValidationError') {
+    const fieldName = Object.keys(error.errors)[0]
+    const fieldError = error.errors[fieldName]
+    let message = 'Validation failed.'
+    
+    if (fieldError.kind === 'maxlength') {
+      message = `${fieldName.charAt(0).toUpperCase() + fieldName.slice(1)} must not exceed ${fieldError.properties.maxlength} characters.`
+    } else if (fieldError.kind === 'minlength') {
+      message = `${fieldName.charAt(0).toUpperCase() + fieldName.slice(1)} must be at least ${fieldError.properties.minlength} characters.`
+    } else if (fieldError.kind === 'required') {
+      message = `${fieldName.charAt(0).toUpperCase() + fieldName.slice(1)} is required.`
+    } else if (fieldError.kind === 'enum') {
+      message = `${fieldName.charAt(0).toUpperCase() + fieldName.slice(1)} must be one of: ${fieldError.enumValues.join(', ')}.`
+    }
+    
+    response.status(400).json({
+      message,
+      error: {
+        code: 'VALIDATION_ERROR',
+        details: null,
+      },
+    })
+    return
+  }
+  
+  response.status(error.statusCode || 500).json({
     message: error.message || 'Unexpected server error.',
+    ...(error.code
+      ? {
+          error: {
+            code: error.code,
+            details: error.details || null,
+          },
+        }
+      : {}),
   })
 })
 
@@ -2110,6 +2649,9 @@ async function start() {
     throw new Error('JWT_SECRET is missing from the server environment.')
   }
 
+  // Initialize Redis cache
+  await initializeRedis()
+
   await mongoose.connect(process.env.MONGODB_URI)
   await ensureAdminAccount()
   await migrateLegacyDraftArticles()
@@ -2119,7 +2661,37 @@ async function start() {
   })
 }
 
-start().catch((error) => {
-  console.error('Failed to start InnoBlog API', error)
-  process.exit(1)
-})
+module.exports = {
+  app,
+  start,
+  PUBLICATION_STATUS,
+  buildDraftPayloadFromContent,
+  buildDraftQuery,
+  buildPublicArticleQuery,
+  buildRequestedDraftQuery,
+  canManageDraft,
+  canViewArticle,
+  canViewDraft,
+  combineArticleQuery,
+  createUniqueArticleSlug,
+  createUniqueDraftSlug,
+  getArticleAuthorId,
+  getArticlePublicationStatus,
+  getDraftAuthorId,
+  getLegacyDraftStatus,
+  isArticlePubliclyVisible,
+  normalizeTags,
+  setArticleDraftState,
+  setArticlePendingReviewState,
+  setArticlePublishedState,
+  validateArticleInput,
+  validateCommentInput,
+  validateProfileInput,
+}
+
+if (require.main === module) {
+  start().catch((error) => {
+    console.error('Failed to start InnoBlog API', error)
+    process.exit(1)
+  })
+}
