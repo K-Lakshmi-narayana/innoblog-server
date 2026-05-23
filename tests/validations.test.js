@@ -1,12 +1,18 @@
 const {
+  ARTICLE_LIMITS,
   normalizeTags,
   validateArticleInput,
+  validateArticleImages,
   validateCommentInput,
   validateProfileInput,
 } = require('../index')
 
 function buildLongBody(length = 140) {
   return `<p>${'A'.repeat(length)}</p>`
+}
+
+function buildDataImage(byteSize, mimeType = 'image/png') {
+  return `data:${mimeType};base64,${Buffer.alloc(byteSize).toString('base64')}`
 }
 
 describe('backend validation helpers', () => {
@@ -104,6 +110,38 @@ describe('backend validation helpers', () => {
       })
 
       expect(errors).toContain('Article body must have at least 120 characters of content.')
+    })
+
+    it('rejects article bodies above the maximum readable size', () => {
+      const errors = validateArticleInput({
+        title: 'Another valid title',
+        summary: 'A valid summary with enough content.',
+        bodyHtml: buildLongBody(ARTICLE_LIMITS.bodyMaxCharacters + 1),
+        domain: 'ml',
+        tags: ['Machine Learning', 'Model Evaluation', 'Feature Engineering'],
+      })
+
+      expect(errors).toContain('Article body must not exceed 60,000 characters.')
+    })
+
+    it('rejects oversized or unsupported uploaded article images', () => {
+      const oversizedCover = buildDataImage(ARTICLE_LIMITS.imageMaxBytes + 1)
+      const errors = validateArticleInput({
+        title: 'A valid title',
+        summary: 'A valid summary with enough content.',
+        bodyHtml: buildLongBody(180),
+        coverImage: oversizedCover,
+        domain: 'ml',
+        tags: ['Machine Learning', 'Model Evaluation', 'Feature Engineering'],
+      })
+
+      expect(errors).toContain('Cover image must be 2 MB or smaller. Choose a smaller image.')
+
+      expect(
+        validateArticleImages({
+          bodyHtml: `<p>${'A'.repeat(160)}</p><img src="${buildDataImage(100, 'image/svg+xml')}" />`,
+        }),
+      ).toContain('Article images must be JPEG, PNG, WebP, or GIF files.')
     })
   })
 

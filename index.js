@@ -60,6 +60,11 @@ const {
   rankTagSuggestions,
   resolveTagLabel,
 } = require('./constants/tagSuggestions')
+const {
+  ALLOWED_ARTICLE_IMAGE_MIME_TYPES,
+  ARTICLE_LIMITS,
+  formatBytes,
+} = require('./constants/articleLimits')
 
 if (process.env.NODE_ENV !== "production") {
   require("dotenv").config();
@@ -98,6 +103,20 @@ function ensure(condition, message, statusCode = 400, code = 'BAD_REQUEST', deta
   }
 }
 
+function sendRequestError(response, error, fallbackStatusCode = 400) {
+  response.status(error.statusCode || fallbackStatusCode).json({
+    message: error.message || 'Request failed.',
+    ...(error.code
+      ? {
+          error: {
+            code: error.code,
+            details: error.details || null,
+          },
+        }
+      : {}),
+  })
+}
+
 function validateEmail(value = '') {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)
 }
@@ -123,6 +142,126 @@ function normalizeTags(tags = [], domain = '') {
   return normalizedTags
 }
 
+function formatNumber(value) {
+  return Number(value).toLocaleString('en-US')
+}
+
+function getDataUrlImageInfo(dataUrl = '') {
+  const match = String(dataUrl).match(/^data:([^;,]+)(;base64)?,([\s\S]*)$/i)
+
+  if (!match) {
+    return null
+  }
+
+  const mimeType = String(match[1] || '').toLowerCase()
+  const isBase64 = Boolean(match[2])
+  const payload = match[3] || ''
+  let byteSize = 0
+
+  if (isBase64) {
+    const cleanedPayload = payload.replace(/\s/g, '')
+    const paddingLength = cleanedPayload.endsWith('==')
+      ? 2
+      : cleanedPayload.endsWith('=')
+      ? 1
+      : 0
+
+    byteSize = Math.max(0, Math.floor((cleanedPayload.length * 3) / 4) - paddingLength)
+  } else {
+    try {
+      byteSize = Buffer.byteLength(decodeURIComponent(payload), 'utf8')
+    } catch {
+      byteSize = Buffer.byteLength(payload, 'utf8')
+    }
+  }
+
+  return {
+    byteSize,
+    mimeType,
+  }
+}
+
+function getEmbeddedDataImages(bodyHtml = '') {
+  const embeddedImages = []
+  const sourceHtml = String(bodyHtml || '')
+  const imageRegex = /<img\b[^>]*\bsrc=(["'])(data:[^"']+)\1[^>]*>/gi
+  let match = imageRegex.exec(sourceHtml)
+
+  while (match) {
+    embeddedImages.push(match[2])
+    match = imageRegex.exec(sourceHtml)
+  }
+
+  return embeddedImages
+}
+
+function validateArticleImageDataUrl(dataUrl, label) {
+  const errors = []
+  const imageInfo = getDataUrlImageInfo(dataUrl)
+
+  if (!imageInfo) {
+    return {
+      byteSize: 0,
+      errors: [`${label} could not be read. Upload it again as a JPEG, PNG, WebP, or GIF image.`],
+    }
+  }
+
+  if (!ALLOWED_ARTICLE_IMAGE_MIME_TYPES.includes(imageInfo.mimeType)) {
+    errors.push('Article images must be JPEG, PNG, WebP, or GIF files.')
+  }
+
+  if (imageInfo.byteSize > ARTICLE_LIMITS.imageMaxBytes) {
+    errors.push(
+      `${label} must be ${formatBytes(ARTICLE_LIMITS.imageMaxBytes)} or smaller. Choose a smaller image.`,
+    )
+  }
+
+  return {
+    byteSize: imageInfo.byteSize,
+    errors,
+  }
+}
+
+function validateArticleImages(input = {}) {
+  const errors = []
+  const imageEntries = []
+  const coverImage = String(input.coverImage || '').trim()
+
+  if (/^data:/i.test(coverImage)) {
+    imageEntries.push({
+      label: 'Cover image',
+      src: coverImage,
+    })
+  }
+
+  getEmbeddedDataImages(input.bodyHtml).forEach((src, index) => {
+    imageEntries.push({
+      label: `Article image ${index + 1}`,
+      src,
+    })
+  })
+
+  if (imageEntries.length > ARTICLE_LIMITS.maxUploadedImages) {
+    errors.push(
+      `Use up to ${ARTICLE_LIMITS.maxUploadedImages} uploaded images per article, including the cover image.`,
+    )
+  }
+
+  const totalImageBytes = imageEntries.reduce((total, imageEntry) => {
+    const validation = validateArticleImageDataUrl(imageEntry.src, imageEntry.label)
+    errors.push(...validation.errors)
+    return total + validation.byteSize
+  }, 0)
+
+  if (totalImageBytes > ARTICLE_LIMITS.totalImageMaxBytes) {
+    errors.push(
+      `Uploaded article images must total ${formatBytes(ARTICLE_LIMITS.totalImageMaxBytes)} or less.`,
+    )
+  }
+
+  return errors
+}
+
 function validateArticleInput(input) {
   const errors = []
 
@@ -144,14 +283,26 @@ function validateArticleInput(input) {
     errors.push('Summary must not exceed 500 characters.')
   }
 
-  // Body validation: min 120 chars
+  // Body validation: readable text length plus markup size
   if (!input.bodyHtml || !input.bodyHtml.trim()) {
     errors.push('Article body is required.')
   } else {
-    // Remove HTML tags to check text content
     const plainText = input.bodyHtml.replace(/<[^>]*>/g, '').trim()
-    if (plainText.length < 120) {
-      errors.push('Article body must have at least 120 characters of content.')
+    if (plainText.length < ARTICLE_LIMITS.bodyMinCharacters) {
+      errors.push(
+        `Article body must have at least ${ARTICLE_LIMITS.bodyMinCharacters} characters of content.`,
+      )
+    } else if (plainText.length > ARTICLE_LIMITS.bodyMaxCharacters) {
+      errors.push(
+        `Article body must not exceed ${formatNumber(ARTICLE_LIMITS.bodyMaxCharacters)} characters.`,
+      )
+    }
+
+    const htmlLengthWithoutUploadedImages = stripBase64Images(input.bodyHtml).length
+    if (htmlLengthWithoutUploadedImages > ARTICLE_LIMITS.htmlMaxCharacters) {
+      errors.push(
+        `Article formatting is too large. Keep the article HTML under ${formatNumber(ARTICLE_LIMITS.htmlMaxCharacters)} characters, not counting uploaded images.`,
+      )
     }
   }
 
@@ -185,6 +336,8 @@ function validateArticleInput(input) {
   if (unknownTags.length > 0) {
     errors.push(`Choose tags from the selected domain list. Remove: ${unknownTags.join(', ')}.`)
   }
+
+  errors.push(...validateArticleImages(input))
 
   return errors
 }
@@ -526,6 +679,7 @@ async function saveDraftFromRequest(input, user, existingDraft = null) {
     summary: data.summary,
     bodyHtml: data.bodyHtml,
     coverLabel: data.coverLabel,
+    coverImage: data.coverImage,
     domain: data.domain,
     tags: data.tags,
   })
@@ -568,6 +722,16 @@ async function clearPendingPublicationRequestsForDraft(draftId) {
 }
 
 async function createPublishedArticleFromDraft(draft, reviewedBy, notes = '') {
+  ensureValidArticleInput({
+    title: draft.title,
+    summary: draft.summary,
+    bodyHtml: draft.bodyHtml,
+    coverLabel: draft.coverLabel,
+    coverImage: draft.coverImage || '',
+    domain: draft.domain,
+    tags: draft.tags || [],
+  })
+
   const article = await Article.create({
     author: draft.author,
     title: draft.title,
@@ -709,7 +873,7 @@ app.use(
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
   }),
 )
-app.use(express.json({ limit: '4mb' }))
+app.use(express.json({ limit: ARTICLE_LIMITS.requestJsonLimit }))
 
 app.get(
   '/api/health',
@@ -1141,7 +1305,7 @@ app.post(
         }),
       })
     } catch (error) {
-      response.status(400).json({ message: error.message })
+      sendRequestError(response, error)
     }
   }),
 )
@@ -1275,7 +1439,7 @@ app.patch(
         }),
       })
     } catch (error) {
-      response.status(400).json({ message: error.message })
+      sendRequestError(response, error)
     }
   }),
 )
@@ -1457,13 +1621,17 @@ app.post(
 
     const { bodyHtml, toc, readTime, plainText } = buildArticleContent(body)
     const summary = buildSummary(request.body.summary || '', plainText)
+    const coverLabel = request.body.coverLabel?.trim() || domain.toUpperCase()
+    const coverImage = request.body.coverImage?.trim() || ''
+    const tags = normalizeTags(request.body.tags, domain)
 
     ensureValidArticleInput({
       title,
       summary,
       bodyHtml,
-      coverLabel: request.body.coverLabel?.trim() || domain.toUpperCase(),
-      tags: normalizeTags(request.body.tags, domain),
+      coverLabel,
+      coverImage,
+      tags,
       domain,
     })
 
@@ -1473,9 +1641,9 @@ app.post(
       slug: await createUniqueArticleSlug(title),
       summary,
       domain,
-      coverLabel: request.body.coverLabel?.trim() || domain.toUpperCase(),
-      coverImage: request.body.coverImage?.trim() || '',
-      tags: normalizeTags(request.body.tags, domain),
+      coverLabel,
+      coverImage,
+      tags,
       bodyHtml,
       toc,
       publishedAt: new Date(),
@@ -1622,24 +1790,28 @@ app.patch(
       return
     }
 
-    article.title = titleUpdate
-    article.summary = buildSummary(request.body.summary || '', bodyUpdate)
-    article.domain = domainUpdate
-    article.coverLabel = request.body.coverLabel?.trim() || domainUpdate.toUpperCase()
-    article.coverImage = request.body.coverImage?.trim() || ''
-    article.tags = normalizeTags(request.body.tags, domainUpdate)
-
     const { bodyHtml, toc, readTime, plainText } = buildArticleContent(bodyUpdate)
+    const summary = buildSummary(request.body.summary || '', plainText)
+    const coverLabel = request.body.coverLabel?.trim() || domainUpdate.toUpperCase()
+    const coverImage = request.body.coverImage?.trim() || ''
+    const tags = normalizeTags(request.body.tags, domainUpdate)
 
     ensureValidArticleInput({
       title: titleUpdate,
-      summary: buildSummary(request.body.summary || '', plainText),
+      summary,
       bodyHtml,
-      coverLabel: request.body.coverLabel?.trim() || domainUpdate.toUpperCase(),
+      coverLabel,
+      coverImage,
       domain: domainUpdate,
-      tags: normalizeTags(request.body.tags, domainUpdate),
+      tags,
     })
 
+    article.title = titleUpdate
+    article.summary = summary
+    article.domain = domainUpdate
+    article.coverLabel = coverLabel
+    article.coverImage = coverImage
+    article.tags = tags
     article.bodyHtml = bodyHtml
     article.toc = toc
     article.readTime = readTime
@@ -2600,6 +2772,20 @@ app.use((error, request, response, next) => {
   }
 
   console.error(error)
+
+  if (error.type === 'entity.too.large') {
+    response.status(413).json({
+      message: `This article request is too large. Keep article text under ${formatNumber(ARTICLE_LIMITS.bodyMaxCharacters)} characters and each image under ${formatBytes(ARTICLE_LIMITS.imageMaxBytes)}.`,
+      error: {
+        code: 'PAYLOAD_TOO_LARGE',
+        details: {
+          requestMaxBytes: ARTICLE_LIMITS.requestMaxBytes,
+          articleLimits: ARTICLE_LIMITS,
+        },
+      },
+    })
+    return
+  }
   
   // Handle Mongoose validation errors
   if (error.name === 'ValidationError') {
@@ -2664,6 +2850,7 @@ async function start() {
 module.exports = {
   app,
   start,
+  ARTICLE_LIMITS,
   PUBLICATION_STATUS,
   buildDraftPayloadFromContent,
   buildDraftQuery,
@@ -2685,6 +2872,7 @@ module.exports = {
   setArticlePendingReviewState,
   setArticlePublishedState,
   validateArticleInput,
+  validateArticleImages,
   validateCommentInput,
   validateProfileInput,
 }
