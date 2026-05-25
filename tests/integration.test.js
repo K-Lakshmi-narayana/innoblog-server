@@ -137,10 +137,17 @@ afterAll(async () => {
 describe('backend integration flows', () => {
   it('returns health status', async () => {
     const response = await request(app).get('/api/health')
+    const versionedResponse = await request(app).get('/api/v1/health')
 
     expect(response.status).toBe(200)
     expect(response.body.ok).toBe(true)
+    expect(response.body.apiVersion).toBe('v1')
+    expect(response.headers['x-api-version']).toBe('v1')
     expect(['connected', 'connecting']).toContain(response.body.database)
+    expect(versionedResponse.status).toBe(200)
+    expect(versionedResponse.body.ok).toBe(true)
+    expect(versionedResponse.body.apiVersion).toBe('v1')
+    expect(versionedResponse.headers['x-api-version']).toBe('v1')
   })
 
   describe('OTP auth flow', () => {
@@ -332,7 +339,7 @@ describe('backend integration flows', () => {
       const draftResponse = await request(app)
         .post('/api/drafts')
         .set('Authorization', `Bearer ${authorToken}`)
-        .send(buildArticlePayload({ domain: 'ml', title: 'Private Draft Story' }))
+        .send(buildArticlePayload({ domain: 'ml', title: 'Private Draft Article' }))
 
       expect(draftResponse.status).toBe(201)
 
@@ -361,7 +368,7 @@ describe('backend integration flows', () => {
         .patch(`/api/drafts/${draftId}`)
         .set('Authorization', `Bearer ${authorToken}`)
         .send({
-          ...buildArticlePayload({ domain: 'ml', title: 'Private Draft Story' }),
+          ...buildArticlePayload({ domain: 'ml', title: 'Private Draft Article' }),
           publishDirectly: true,
         })
 
@@ -371,7 +378,7 @@ describe('backend integration flows', () => {
         .patch(`/api/drafts/${draftId}`)
         .set('Authorization', `Bearer ${adminToken}`)
         .send({
-          ...buildArticlePayload({ domain: 'ml', title: 'Private Draft Story' }),
+          ...buildArticlePayload({ domain: 'ml', title: 'Private Draft Article' }),
           publishDirectly: true,
         })
 
@@ -385,7 +392,7 @@ describe('backend integration flows', () => {
         .patch(`/api/articles/${articleId}`)
         .set('Authorization', `Bearer ${adminToken}`)
         .send({
-          ...buildArticlePayload({ domain: 'ml', title: 'Private Draft Story' }),
+          ...buildArticlePayload({ domain: 'ml', title: 'Private Draft Article' }),
           saveAsDraft: true,
         })
 
@@ -406,7 +413,7 @@ describe('backend integration flows', () => {
         .patch(`/api/articles/${articleId}`)
         .set('Authorization', `Bearer ${adminToken}`)
         .send({
-          ...buildArticlePayload({ domain: 'ml', title: 'Private Draft Story' }),
+          ...buildArticlePayload({ domain: 'ml', title: 'Private Draft Article' }),
           publishDirectly: true,
         })
 
@@ -570,7 +577,7 @@ describe('backend integration flows', () => {
       const firstDraftResponse = await request(app)
         .post('/api/drafts')
         .set('Authorization', `Bearer ${authorToken}`)
-        .send(buildArticlePayload({ domain: 'ds', title: 'Approve This Story' }))
+        .send(buildArticlePayload({ domain: 'ds', title: 'Approve This Article' }))
 
       const firstDraftId = firstDraftResponse.body.draft.id
 
@@ -603,7 +610,7 @@ describe('backend integration flows', () => {
       const secondDraftResponse = await request(app)
         .post('/api/drafts')
         .set('Authorization', `Bearer ${authorToken}`)
-        .send(buildArticlePayload({ domain: 'nlp', title: 'Reject This Story' }))
+        .send(buildArticlePayload({ domain: 'nlp', title: 'Reject This Article' }))
 
       const secondDraftId = secondDraftResponse.body.draft.id
 
@@ -679,7 +686,7 @@ describe('backend integration flows', () => {
       const articleResponse = await request(app)
         .post('/api/articles')
         .set('Authorization', `Bearer ${adminToken}`)
-        .send(buildArticlePayload({ title: 'Valid Admin Story' }))
+        .send(buildArticlePayload({ title: 'Valid Admin Article' }))
 
       const commentResponse = await request(app)
         .post(`/api/articles/${articleResponse.body.article.id}/comments`)
@@ -701,7 +708,7 @@ describe('backend integration flows', () => {
       const invalidLinkResponse = await request(app).post('/api/publish-requests').send({
         name: 'Guest Writer',
         email: 'guest@example.com',
-        articleTitle: 'Guest Story',
+        articleTitle: 'Guest Article',
         googleDocsLink: 'https://example.com/not-docs',
       })
 
@@ -710,9 +717,9 @@ describe('backend integration flows', () => {
       const validPublishRequestResponse = await request(app).post('/api/publish-requests').send({
         name: 'Guest Writer',
         email: 'guest@example.com',
-        articleTitle: 'Guest Story',
+        articleTitle: 'Guest Article',
         articleSummary: 'A strong guest submission for editorial review.',
-        googleDocsLink: 'https://docs.google.com/document/d/guest-story/edit',
+        googleDocsLink: 'https://docs.google.com/document/d/guest-article/edit',
         creditName: 'Guest Author',
         creditEmail: 'credit@example.com',
       })

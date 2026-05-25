@@ -15,7 +15,7 @@ function stripBase64Images(value = '') {
 }
 
 function buildArticleContent(value = '') {
-  const cleanHtml = sanitizeHtmlInput(value).trim() || '<p>Untitled story.</p>'
+  const cleanHtml = sanitizeHtmlInput(value).trim() || '<p>Untitled article.</p>'
   const headingCounts = new Map()
   const toc = []
 

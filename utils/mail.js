@@ -65,7 +65,7 @@ async function sendWriterAccessGrantedEmail({ to, grantedBy }) {
             <li>Submit articles for publication</li>
             <li>Manage your profile and publications</li>
           </ul>
-          <a href="https://innoblog-client.vercel.app/#/create" style="display:inline-block;padding:12px 24px;background:#d31313;color:#fff;text-decoration:none;border-radius:8px;font-weight:600">Start Writing</a>
+          <a href="https://innoblog-client.vercel.app/create" style="display:inline-block;padding:12px 24px;background:#d31313;color:#fff;text-decoration:none;border-radius:8px;font-weight:600">Start Writing</a>
           <p style="margin:20px 0 0;color:#7a5555;font-size:13px">If you have any questions, feel free to reach out to the InnoBlog team.</p>
         </div>
       </div>

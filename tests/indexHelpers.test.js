@@ -46,9 +46,9 @@ describe('index helper logic', () => {
     it('creates a unique draft slug when the first candidate is available', async () => {
       jest.spyOn(Draft, 'exists').mockResolvedValue(false)
 
-      const slug = await createUniqueDraftSlug('Draft Ready Story')
+      const slug = await createUniqueDraftSlug('Draft Ready Article')
 
-      expect(slug).toBe('draft-ready-story')
+      expect(slug).toBe('draft-ready-article')
     })
   })
 
@@ -209,17 +209,17 @@ describe('index helper logic', () => {
   describe('draft payload builder', () => {
     it('returns validation errors when required draft fields are missing', () => {
       expect(buildDraftPayloadFromContent({ title: '', domain: 'ml', body: '' })).toEqual({
-        error: 'Title, domain, and body are required.',
+        error: 'Title, topic, and body are required.',
       })
 
       expect(
         buildDraftPayloadFromContent({
           title: 'Draft title',
           domain: 'unknown',
-          body: '<p>Story body</p>',
+          body: '<p>Article body</p>',
         }),
       ).toEqual({
-        error: 'Choose a valid article domain.',
+        error: 'Choose a valid article topic.',
       })
     })
 

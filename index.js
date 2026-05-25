@@ -35,6 +35,7 @@ const { buildArticleContent, buildSummary, stripBase64Images } = require('./util
 const { sendEmail, sendOtpEmail, sendWriterAccessGrantedEmail, sendWriterAccessRevokedEmail } = require('./utils/mail')
 const PublishRequest = require('./models/PublishRequest')
 const PublicationRequest = require('./models/PublicationRequest')
+const SuggestionRequest = require('./models/SuggestionRequest')
 const {
   buildProfileMap,
   hasId,
@@ -75,6 +76,7 @@ loadEnv()
 const app = express()
 const PORT = Number(process.env.PORT || 4000)
 const OTP_EXPIRY_MINUTES = 10
+const API_VERSION = 'v1'
 
 // Simple cache for domain stats (30 second TTL)
 let domainStatsCache = null
@@ -121,6 +123,129 @@ function validateEmail(value = '') {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)
 }
 
+function escapeHtml(value = '') {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
+
+const SEARCH_STOP_WORDS = new Set([
+  'a',
+  'an',
+  'and',
+  'are',
+  'as',
+  'at',
+  'be',
+  'by',
+  'for',
+  'from',
+  'how',
+  'in',
+  'into',
+  'is',
+  'it',
+  'of',
+  'on',
+  'or',
+  'that',
+  'the',
+  'to',
+  'with',
+])
+
+function tokenizeSearchText(value = '') {
+  return String(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9+#.\s-]/g, ' ')
+    .split(/\s+/)
+    .map((token) => token.trim())
+    .filter((token) => token.length > 1 && !SEARCH_STOP_WORDS.has(token))
+}
+
+function getSearchTextForArticle(article) {
+  return [
+    article.title,
+    article.title,
+    article.title,
+    article.summary,
+    article.summary,
+    article.coverLabel,
+    article.domain,
+    ...(article.tags || []),
+    ...(article.tags || []),
+  ].filter(Boolean).join(' ')
+}
+
+function rankArticlesByBm25(articles = [], search = '') {
+  const queryTokens = [...new Set(tokenizeSearchText(search))]
+
+  if (!queryTokens.length || !articles.length) {
+    return []
+  }
+
+  const documentTokens = articles.map((article) => tokenizeSearchText(getSearchTextForArticle(article)))
+  const documentFrequency = new Map()
+
+  documentTokens.forEach((tokens) => {
+    new Set(tokens).forEach((token) => {
+      documentFrequency.set(token, (documentFrequency.get(token) || 0) + 1)
+    })
+  })
+
+  const totalDocuments = articles.length
+  const averageDocumentLength =
+    documentTokens.reduce((total, tokens) => total + tokens.length, 0) / totalDocuments || 1
+  const k1 = 1.5
+  const b = 0.75
+
+  return articles
+    .map((article, index) => {
+      const tokens = documentTokens[index]
+      const tokenFrequency = new Map()
+
+      tokens.forEach((token) => {
+        tokenFrequency.set(token, (tokenFrequency.get(token) || 0) + 1)
+      })
+
+      const documentLength = Math.max(tokens.length, 1)
+      const score = queryTokens.reduce((total, token) => {
+        const frequency = tokenFrequency.get(token) || 0
+        const matchingDocuments = documentFrequency.get(token) || 0
+
+        if (!frequency || !matchingDocuments) {
+          return total
+        }
+
+        const idf = Math.log(1 + (totalDocuments - matchingDocuments + 0.5) / (matchingDocuments + 0.5))
+        const denominator = frequency + k1 * (1 - b + b * (documentLength / averageDocumentLength))
+
+        return total + idf * ((frequency * (k1 + 1)) / denominator)
+      }, 0)
+
+      return {
+        article,
+        score,
+      }
+    })
+    .filter((entry) => entry.score > 0)
+    .sort((left, right) => {
+      if (right.score !== left.score) {
+        return right.score - left.score
+      }
+
+      if ((right.article.likeCount || 0) !== (left.article.likeCount || 0)) {
+        return (right.article.likeCount || 0) - (left.article.likeCount || 0)
+      }
+
+      return new Date(right.article.publishedAt || 0) - new Date(left.article.publishedAt || 0)
+    })
+    .map((entry) => entry.article)
+}
+
 function normalizeTags(tags = [], domain = '') {
   const rawTags = Array.isArray(tags) ? tags : String(tags).split(',')
   const seenTags = new Set()
@@ -144,6 +269,24 @@ function normalizeTags(tags = [], domain = '') {
 
 function formatNumber(value) {
   return Number(value).toLocaleString('en-US')
+}
+
+function getArticleSortOption(sortParam = 'recent') {
+  const sort = String(sortParam || 'recent').trim().toLowerCase()
+
+  if (sort === 'top') {
+    return { likeCount: -1, commentCount: -1, publishedAt: -1 }
+  }
+
+  if (sort === 'a-z' || sort === 'az') {
+    return { title: 1 }
+  }
+
+  if (sort === 'z-a' || sort === 'za') {
+    return { title: -1 }
+  }
+
+  return { publishedAt: -1 }
 }
 
 function getDataUrlImageInfo(dataUrl = '') {
@@ -334,7 +477,7 @@ function validateArticleInput(input) {
 
   const unknownTags = getUnknownTags(tags, input.domain)
   if (unknownTags.length > 0) {
-    errors.push(`Choose tags from the selected domain list. Remove: ${unknownTags.join(', ')}.`)
+    errors.push(`Choose tags from the selected topic list. Remove: ${unknownTags.join(', ')}.`)
   }
 
   errors.push(...validateArticleImages(input))
@@ -641,11 +784,11 @@ function buildDraftPayloadFromContent(input, existingDraft = null) {
   const body = input.body?.trim()
 
   if (!title || !domain || !body) {
-    return { error: 'Title, domain, and body are required.' }
+    return { error: 'Title, topic, and body are required.' }
   }
 
   if (!DOMAINS.includes(domain)) {
-    return { error: 'Choose a valid article domain.' }
+    return { error: 'Choose a valid article topic.' }
   }
 
   const { bodyHtml, toc, readTime, plainText } = buildArticleContent(body)
@@ -874,12 +1017,24 @@ app.use(
   }),
 )
 app.use(express.json({ limit: ARTICLE_LIMITS.requestJsonLimit }))
+app.use((request, response, next) => {
+  if (request.originalUrl === `/api/${API_VERSION}` || request.originalUrl.startsWith(`/api/${API_VERSION}/`)) {
+    request.url = request.url.replace(new RegExp(`^/api/${API_VERSION}(?=/|$)`), '/api')
+  }
+
+  if (request.originalUrl.startsWith('/api/')) {
+    response.set('X-API-Version', API_VERSION)
+  }
+
+  next()
+})
 
 app.get(
   '/api/health',
   asyncHandler(async (request, response) => {
     response.json({
       ok: true,
+      apiVersion: API_VERSION,
       database: mongoose.connection.readyState === 1 ? 'connected' : 'connecting',
     })
   }),
@@ -1105,7 +1260,7 @@ app.get(
 )
 
 app.get(
-  '/api/domains/stats',
+  ['/api/domains/stats', '/api/topics/stats'],
   asyncHandler(async (request, response) => {
     // Check Redis cache first
     let cachedStats = await getDomainStats()
@@ -1148,7 +1303,7 @@ app.get(
   asyncHandler(async (request, response) => {
     const query = buildPublicArticleQuery()
     const search = request.query.search?.trim()
-    const domain = request.query.domain?.trim()
+    const domain = (request.query.topic || request.query.domain)?.trim()
     const authorHandle = request.query.author?.trim()
     const page = Math.max(1, Number(request.query.page) || 1)
     const limit = request.query.limit
@@ -1170,7 +1325,7 @@ app.get(
 
     if (domain) {
       if (!DOMAINS.includes(domain)) {
-        response.status(400).json({ message: 'Unknown domain requested.' })
+        response.status(400).json({ message: 'Unknown topic requested.' })
         return
       }
 
@@ -1188,14 +1343,6 @@ app.get(
       query.author = authorProfile.user
     }
 
-    if (search) {
-      query.$or = [
-        { title: { $regex: search, $options: 'i' } },
-        { summary: { $regex: search, $options: 'i' } },
-        { tags: { $regex: search, $options: 'i' } },
-      ]
-    }
-
     const skip = (page - 1) * limit
 
     let sortOption = { publishedAt: -1 }
@@ -1206,6 +1353,34 @@ app.get(
       sortOption = { title: 1 }
     } else if (sortParam === 'z-a' || sortParam === 'za') {
       sortOption = { title: -1 }
+    }
+
+    if (search) {
+      const searchableArticles = await Article.find(query)
+        .select('-bodyHtml -toc')
+        .lean()
+      const rankedArticles = rankArticlesByBm25(searchableArticles, search)
+      const paginatedArticles = rankedArticles.slice(skip, skip + limit)
+      const profileMap = await buildProfileMap(
+        paginatedArticles.map((article) => article.author),
+      )
+
+      response.json({
+        articles: paginatedArticles.map((article) =>
+          serializeArticle(article, {
+            profileMap,
+            viewerId: request.user?._id,
+          }),
+        ),
+        totalCount: rankedArticles.length,
+        page,
+        limit,
+        totalPages: Math.ceil(rankedArticles.length / limit),
+        sort: sortParam,
+        search,
+        searchMode: 'bm25',
+      })
+      return
     }
 
     const totalCount = await Article.countDocuments(query)
@@ -1259,10 +1434,10 @@ app.get(
 app.get(
   '/api/tags/suggestions',
   asyncHandler(async (request, response) => {
-    const domain = String(request.query.domain || '').trim().toLowerCase()
+    const domain = String(request.query.topic || request.query.domain || '').trim().toLowerCase()
 
-    ensure(domain, 'Domain parameter is required.', 400, 'VALIDATION_ERROR')
-    ensure(DOMAINS.includes(domain), 'Choose a valid article domain.', 400, 'VALIDATION_ERROR')
+    ensure(domain, 'Topic parameter is required.', 400, 'VALIDATION_ERROR')
+    ensure(DOMAINS.includes(domain), 'Choose a valid article topic.', 400, 'VALIDATION_ERROR')
 
     const cacheKey = `tags:suggestions:v2:${domain}`
     const cachedTags = await getCache(cacheKey)
@@ -1610,12 +1785,12 @@ app.post(
     const body = request.body.body?.trim()
 
     if (!title || !domain || !body) {
-      response.status(400).json({ message: 'Title, domain, and body are required.' })
+      response.status(400).json({ message: 'Title, topic, and body are required.' })
       return
     }
 
     if (!DOMAINS.includes(domain)) {
-      response.status(400).json({ message: 'Choose a valid article domain.' })
+      response.status(400).json({ message: 'Choose a valid article topic.' })
       return
     }
 
@@ -1781,12 +1956,12 @@ app.patch(
     const bodyUpdate = request.body.body?.trim()
 
     if (!titleUpdate || !domainUpdate || !bodyUpdate) {
-      response.status(400).json({ message: 'Title, domain, and body are required.' })
+      response.status(400).json({ message: 'Title, topic, and body are required.' })
       return
     }
 
     if (!DOMAINS.includes(domainUpdate)) {
-      response.status(400).json({ message: 'Choose a valid article domain.' })
+      response.status(400).json({ message: 'Choose a valid article topic.' })
       return
     }
 
@@ -1940,11 +2115,12 @@ app.get(
     const page = parseInt(request.query.page) || 1
     const limit = parseInt(request.query.limit) || 10
     const skip = (page - 1) * limit
+    const sortOption = getArticleSortOption(request.query.sort)
 
     const query = buildPublicArticleQuery({ author: request.user._id })
     const [articles, totalArticles] = await Promise.all([
       fetchArticleCollection(query, request.user._id, {
-        sort: { publishedAt: -1 },
+        sort: sortOption,
         skip,
         limit,
       }),
@@ -2009,11 +2185,12 @@ app.get(
     const page = parseInt(request.query.page) || 1
     const limit = parseInt(request.query.limit) || 10
     const skip = (page - 1) * limit
+    const sortOption = getArticleSortOption(request.query.sort)
 
     const query = buildPublicArticleQuery({ author: user._id })
     const [articles, totalArticles] = await Promise.all([
       fetchArticleCollection(query, request.user?._id, {
-        sort: { publishedAt: -1 },
+        sort: sortOption,
         skip,
         limit,
       }),
@@ -2324,6 +2501,7 @@ app.get(
     const page = Math.max(1, Number(request.query.page) || 1)
     const limit = Number(request.query.limit) || 10
     const skip = (page - 1) * limit
+    const sortOption = getArticleSortOption(request.query.sort)
 
     // First, clean up any stale requests
     const allRequests = await PublicationRequest.find({ status: 'pending' })
@@ -2455,7 +2633,7 @@ app.post(
         subject: 'Your article has been published!',
         text: `Congratulations! Your article "${article.title}" has been published on InnoBlog.
 
-View your article: ${process.env.FRONTEND_URL || 'http://localhost:3000'}/articles/${article.slug}
+View your article: ${process.env.FRONTEND_URL || 'http://localhost:3000'}/article/${article.slug}
 
 ${request.body.notes ? `Admin notes: ${request.body.notes}` : ''}`,
         html: `
@@ -2464,7 +2642,7 @@ ${request.body.notes ? `Admin notes: ${request.body.notes}` : ''}`,
               <h2 style="margin:0 0 18px;font-size:24px;line-height:1.2;color:#120808">🎉 Your article has been published!</h2>
               <p style="margin:0 0 12px;font-size:15px;color:#4b2f2f"><strong>Article:</strong> ${article.title}</p>
               <p style="margin:0 0 12px;font-size:15px;color:#4b2f2f">
-                <a href="${process.env.FRONTEND_URL || 'http://localhost:3000'}/articles/${article.slug}" style="color:#d31313;text-decoration:none;">View your published article</a>
+                <a href="${process.env.FRONTEND_URL || 'http://localhost:3000'}/article/${article.slug}" style="color:#d31313;text-decoration:none;">View your published article</a>
               </p>
               ${request.body.notes ? `<p style="margin:8px 0 0;font-size:14px;color:#5a3a3a;"><strong>Admin notes:</strong> ${request.body.notes}</p>` : ''}
             </div>
@@ -2582,6 +2760,7 @@ app.get(
     const page = Math.max(1, Number(request.query.page) || 1)
     const limit = Number(request.query.limit) || 10
     const skip = (page - 1) * limit
+    const sortOption = getArticleSortOption(request.query.sort)
 
     const query = buildPublicArticleQuery({
       author: request.user._id,
@@ -2589,7 +2768,7 @@ app.get(
 
     const [articles, totalCount] = await Promise.all([
       fetchArticleCollection(query, request.user._id, {
-        sort: { publishedAt: -1 },
+        sort: sortOption,
         skip,
         limit,
       }),
@@ -2634,6 +2813,98 @@ app.get(
       page,
       limit,
       totalPages: Math.ceil(totalCount / limit),
+    })
+  }),
+)
+
+app.post(
+  '/api/suggestions',
+  asyncHandler(async (request, response) => {
+    const name = request.body.name?.trim() || ''
+    const email = normalizeEmail(request.body.email)
+    const suggestionType = String(request.body.suggestionType || '').trim().toLowerCase()
+    const topicName = request.body.topicName?.trim() || ''
+    const articleTitle = request.body.articleTitle?.trim() || ''
+    const details = request.body.details?.trim() || ''
+    const errors = []
+
+    if (name.length < 2) {
+      errors.push('Add your name.')
+    }
+
+    if (!validateEmail(email)) {
+      errors.push('Add a valid email address.')
+    }
+
+    if (!['topic', 'article'].includes(suggestionType)) {
+      errors.push('Choose whether this is a topic or article suggestion.')
+    }
+
+    if (suggestionType === 'topic' && topicName.length < 2) {
+      errors.push('Add the topic name.')
+    }
+
+    if (suggestionType === 'article' && articleTitle.length < 5) {
+      errors.push('Add the article idea.')
+    }
+
+    if (details.length < 15) {
+      errors.push('Add a little more detail about your suggestion.')
+    } else if (details.length > 1000) {
+      errors.push('Keep the suggestion under 1000 characters.')
+    }
+
+    if (errors.length) {
+      response.status(400).json({
+        message: errors.join(' '),
+      })
+      return
+    }
+
+    const suggestionRequest = await SuggestionRequest.create({
+      requesterName: name,
+      requesterEmail: email,
+      suggestionType,
+      topicName,
+      articleTitle,
+      details,
+      status: 'pending',
+    })
+
+    const adminEmail = normalizeEmail(process.env.ADMIN_EMAIL || process.env.MAIL_USER || '')
+    const suggestionLabel = suggestionType === 'topic' ? topicName : articleTitle
+    const suggestionTypeLabel = suggestionType === 'topic' ? 'Topic suggestion' : 'Article request'
+
+    if (adminEmail) {
+      await sendEmail({
+        to: adminEmail,
+        subject: `New InnoBlog ${suggestionTypeLabel.toLowerCase()}`,
+        text: `A new suggestion was submitted by ${name} <${email}>.
+
+Type: ${suggestionTypeLabel}
+Suggestion: ${suggestionLabel}
+
+Details:
+${details}
+`,
+        html: `
+          <div style="font-family:Arial,sans-serif;padding:24px;background:#fff7f7;color:#1b0d0d">
+            <div style="max-width:760px;margin:0 auto;background:#ffffff;border:1px solid #ffd1d1;border-radius:18px;padding:32px">
+              <p style="margin:0 0 20px;color:#d31313;font-size:12px;font-weight:700;letter-spacing:0.14em;text-transform:uppercase">InnoBlog Suggestion</p>
+              <h2 style="margin:0 0 18px;font-size:24px;line-height:1.2;color:#120808">${escapeHtml(suggestionTypeLabel)}</h2>
+              <p style="margin:0 0 12px;font-size:15px;color:#4b2f2f"><strong>Submitted by:</strong> ${escapeHtml(name)} &lt;${escapeHtml(email)}&gt;</p>
+              <p style="margin:0 0 12px;font-size:15px;color:#4b2f2f"><strong>Suggestion:</strong> ${escapeHtml(suggestionLabel)}</p>
+              <p style="margin:20px 0 0;font-size:15px;color:#4b2f2f"><strong>Details:</strong></p>
+              <p style="margin:8px 0 0;font-size:14px;color:#5a3a3a;white-space:pre-wrap;">${escapeHtml(details)}</p>
+            </div>
+          </div>
+        `,
+      })
+    }
+
+    response.status(201).json({
+      message: 'Thanks. Your suggestion was sent to the content team.',
+      requestId: suggestionRequest._id,
     })
   }),
 )

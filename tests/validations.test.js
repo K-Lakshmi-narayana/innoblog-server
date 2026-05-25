@@ -89,7 +89,7 @@ describe('backend validation helpers', () => {
 
       expect(errors).toContain('Maximum 8 tags allowed.')
       expect(errors.some((error) => error.includes('exceeds maximum length of 50 characters'))).toBe(true)
-      expect(errors.some((error) => error.includes('selected domain list'))).toBe(true)
+      expect(errors.some((error) => error.includes('selected topic list'))).toBe(true)
 
       expect(
         validateArticleInput({
