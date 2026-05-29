@@ -138,5 +138,7 @@ articleSchema.index({ publicationStatus: 1, publishedAt: -1 })
 articleSchema.index({ author: 1, publicationStatus: 1, publishedAt: -1 })
 articleSchema.index({ isDraft: 1, publicationStatus: 1 })
 articleSchema.index({ isFeatured: 1, publishedAt: -1 })
+articleSchema.index({ publicationStatus: 1, tags: 1, viewCount: -1 })
+articleSchema.index({ publicationStatus: 1, likeCount: -1, commentCount: -1, publishedAt: -1 })
 
 module.exports = mongoose.models.Article || mongoose.model('Article', articleSchema)

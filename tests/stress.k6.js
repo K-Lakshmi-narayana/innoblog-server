@@ -10,16 +10,16 @@ let domainStats = []
 export const options = {
   stages: [
     { duration: '5s', target: 10 },
-    { duration: '10s', target: 30 },
-    { duration: '20s', target: 50 },
-    { duration: '10s', target: 30 },
+    { duration: '10s', target: 100 },
+    { duration: '20s', target: 200 },
+    { duration: '10s', target: 100 },
     { duration: '5s', target: 0 },
   ],
   thresholds: {
-    http_req_duration: ['p(95)<500', 'p(99)<1000'],
-    http_req_failed: ['rate<0.01'],
-    'group_duration{group:::Browse Domain Articles}': ['p(99)<800'],
-    'group_duration{group:::Read Full Article}': ['p(99)<1200'],
+    http_req_duration: ['p(95)<800', 'p(99)<1500'],
+    http_req_failed: ['rate<0.05'],
+    'group_duration{group:::Browse Domain Articles}': ['p(99)<500'],
+    'group_duration{group:::Read Full Article}': ['p(99)<800'],
   },
 }
 

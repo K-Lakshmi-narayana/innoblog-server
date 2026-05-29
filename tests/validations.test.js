@@ -8,7 +8,7 @@ const {
 } = require('../index')
 
 function buildLongBody(length = 140) {
-  return `<p>${'A'.repeat(length)}</p>`
+  return `<p>${'Readable content '.repeat(Math.ceil(length / 17))}</p>`
 }
 
 function buildDataImage(byteSize, mimeType = 'image/png') {
@@ -122,6 +122,31 @@ describe('backend validation helpers', () => {
       })
 
       expect(errors).toContain('Article body must not exceed 60,000 characters.')
+    })
+
+    it('rejects excessive unbroken text in article fields', () => {
+      const longToken = 'a'.repeat(ARTICLE_LIMITS.unbrokenTextMaxCharacters + 1)
+      const errors = validateArticleInput({
+        title: `Valid ${longToken}`,
+        summary: `A valid summary with ${longToken}`,
+        bodyHtml: `<p>${'Readable article content '.repeat(8)} ${longToken}</p>`,
+        coverLabel: longToken,
+        domain: 'ml',
+        tags: ['Machine Learning', 'Model Evaluation', 'Feature Engineering'],
+      })
+
+      expect(errors).toContain(
+        `Title contains a word or unbroken text run over ${ARTICLE_LIMITS.unbrokenTextMaxCharacters} characters. Add spaces or punctuation so it can wrap cleanly.`,
+      )
+      expect(errors).toContain(
+        `Summary contains a word or unbroken text run over ${ARTICLE_LIMITS.unbrokenTextMaxCharacters} characters. Add spaces or punctuation so it can wrap cleanly.`,
+      )
+      expect(errors).toContain(
+        `Article body contains a word or unbroken text run over ${ARTICLE_LIMITS.unbrokenTextMaxCharacters} characters. Add spaces or punctuation so it can wrap cleanly.`,
+      )
+      expect(errors).toContain(
+        `Cover label contains a word or unbroken text run over ${ARTICLE_LIMITS.unbrokenTextMaxCharacters} characters. Add spaces or punctuation so it can wrap cleanly.`,
+      )
     })
 
     it('rejects oversized or unsupported uploaded article images', () => {

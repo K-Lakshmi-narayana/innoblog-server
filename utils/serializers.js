@@ -86,11 +86,16 @@ function serializeContentDocument(document, {
   profileMap,
   viewerId,
   includeBody = false,
+  includeCoverImage = true,
+  coverImageMaxCharacters = Infinity,
   isPubliclyVisible = false,
   publicationStatus = 'draft',
   publicationRequested = false,
 } = {}) {
   const authorProfile = profileMap?.get(toIdString(document.author?._id || document.author))
+  const coverImage = String(document.coverImage || '')
+  const serializedCoverImage =
+    includeCoverImage && coverImage.length <= coverImageMaxCharacters ? coverImage : ''
 
   const serialized = {
     id: toIdString(document._id),
@@ -99,7 +104,7 @@ function serializeContentDocument(document, {
     summary: document.summary,
     domain: document.domain,
     coverLabel: document.coverLabel,
-    coverImage: document.coverImage || '',
+    coverImage: serializedCoverImage,
     tags: document.tags || [],
     publishedAt: document.publishedAt || null,
     readTime: document.readTime,
@@ -143,7 +148,16 @@ function getArticlePublicationStatus(article) {
   return article.isDraft ? 'draft' : 'published'
 }
 
-function serializeArticle(article, { profileMap, viewerId, includeBody = false } = {}) {
+function serializeArticle(
+  article,
+  {
+    profileMap,
+    viewerId,
+    includeBody = false,
+    includeCoverImage = true,
+    coverImageMaxCharacters = Infinity,
+  } = {},
+) {
   const publicationStatus = getArticlePublicationStatus(article)
   const isPubliclyVisible = publicationStatus === 'published'
 
@@ -151,6 +165,8 @@ function serializeArticle(article, { profileMap, viewerId, includeBody = false }
     profileMap,
     viewerId,
     includeBody,
+    includeCoverImage,
+    coverImageMaxCharacters,
     isPubliclyVisible,
     publicationStatus,
     publicationRequested: publicationStatus === 'pending_review',

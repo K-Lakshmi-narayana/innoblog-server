@@ -4,6 +4,7 @@ const ARTICLE_LIMITS = {
   bodyMinCharacters: 120,
   bodyMaxCharacters: 60000,
   htmlMaxCharacters: 150000,
+  unbrokenTextMaxCharacters: 80,
   imageMaxBytes: 2 * ONE_MB,
   totalImageMaxBytes: 8 * ONE_MB,
   maxUploadedImages: 8,

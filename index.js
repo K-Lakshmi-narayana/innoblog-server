@@ -1,6 +1,7 @@
 const cors = require('cors')
 const express = require('express')
 const mongoose = require('mongoose')
+const zlib = require('zlib')
 const { OAuth2Client } = require('google-auth-library')
 
 const loadEnv = require('./config/loadEnv')
@@ -16,8 +17,11 @@ const {
   getTopArticles,
   getDomainStats,
   getProfileBatch,
+  getCachedArticleDetail,
+  cacheArticleDetail,
   invalidateOnArticleChange,
   invalidateArticleCommentsCache,
+  invalidateArticleDetailCache,
   invalidateArticleFeedCache,
   invalidateTopArticlesCache,
   invalidateProfileCache,
@@ -77,6 +81,11 @@ const app = express()
 const PORT = Number(process.env.PORT || 4000)
 const OTP_EXPIRY_MINUTES = 10
 const API_VERSION = 'v1'
+const PUBLIC_ARTICLES_PER_PAGE = 10
+const LIST_COVER_IMAGE_MAX_CHARACTERS = 20_000
+const ARTICLE_VIEW_FLUSH_INTERVAL_MS = Number(process.env.ARTICLE_VIEW_FLUSH_INTERVAL_MS || 10000)
+const ARTICLE_DETAIL_CACHE_SECONDS = Number(process.env.ARTICLE_DETAIL_CACHE_SECONDS || 600)
+const JSON_COMPRESSION_MIN_BYTES = Number(process.env.JSON_COMPRESSION_MIN_BYTES || 1024)
 
 // Simple cache for domain stats (30 second TTL)
 let domainStatsCache = null
@@ -103,6 +112,73 @@ function ensure(condition, message, statusCode = 400, code = 'BAD_REQUEST', deta
   if (!condition) {
     throw new AppError(statusCode, message, { code, details })
   }
+}
+
+const pendingArticleViews = new Map()
+let articleViewFlushTimer = null
+
+function scheduleArticleViewFlush(delay = ARTICLE_VIEW_FLUSH_INTERVAL_MS) {
+  if (articleViewFlushTimer) {
+    return
+  }
+
+  articleViewFlushTimer = setTimeout(() => {
+    flushArticleViewCounts().catch((error) => {
+      console.error('Failed to flush article view counts:', error)
+    })
+  }, delay)
+
+  if (typeof articleViewFlushTimer.unref === 'function') {
+    articleViewFlushTimer.unref()
+  }
+}
+
+function recordArticleView(articleId) {
+  const id = articleId?.toString?.() || String(articleId || '')
+
+  if (!mongoose.Types.ObjectId.isValid(id)) {
+    return
+  }
+
+  pendingArticleViews.set(id, (pendingArticleViews.get(id) || 0) + 1)
+  scheduleArticleViewFlush()
+}
+
+async function flushArticleViewCounts() {
+  articleViewFlushTimer = null
+
+  if (!pendingArticleViews.size) {
+    return
+  }
+
+  const entries = [...pendingArticleViews.entries()]
+  pendingArticleViews.clear()
+
+  await Article.bulkWrite(
+    entries.map(([articleId, increment]) => ({
+      updateOne: {
+        filter: { _id: articleId },
+        update: { $inc: { viewCount: increment } },
+      },
+    })),
+    { ordered: false },
+  )
+
+  if (pendingArticleViews.size) {
+    scheduleArticleViewFlush()
+  }
+}
+
+async function getArticleCommentCount(article) {
+  if (Number.isFinite(article?.commentCount)) {
+    return Number(article.commentCount)
+  }
+
+  if (!article?._id) {
+    return 0
+  }
+
+  return Comment.countDocuments({ article: article._id })
 }
 
 function sendRequestError(response, error, fallbackStatusCode = 400) {
@@ -271,6 +347,23 @@ function formatNumber(value) {
   return Number(value).toLocaleString('en-US')
 }
 
+function getLongUnbrokenTextRun(value = '') {
+  return String(value || '')
+    .replace(/<[^>]*>/g, ' ')
+    .split(/\s+/)
+    .find((part) => part.length > ARTICLE_LIMITS.unbrokenTextMaxCharacters)
+}
+
+function validateUnbrokenTextRun(value, label) {
+  const longRun = getLongUnbrokenTextRun(value)
+
+  if (!longRun) {
+    return null
+  }
+
+  return `${label} contains a word or unbroken text run over ${ARTICLE_LIMITS.unbrokenTextMaxCharacters} characters. Add spaces or punctuation so it can wrap cleanly.`
+}
+
 function getArticleSortOption(sortParam = 'recent') {
   const sort = String(sortParam || 'recent').trim().toLowerCase()
 
@@ -415,6 +508,11 @@ function validateArticleInput(input) {
     errors.push('Title must be at least 5 characters.')
   } else if (input.title.length > 200) {
     errors.push('Title must not exceed 200 characters.')
+  } else {
+    const unbrokenTextError = validateUnbrokenTextRun(input.title, 'Title')
+    if (unbrokenTextError) {
+      errors.push(unbrokenTextError)
+    }
   }
 
   // Summary validation: 10-500 chars
@@ -424,6 +522,11 @@ function validateArticleInput(input) {
     errors.push('Summary must be at least 10 characters.')
   } else if (input.summary.length > 500) {
     errors.push('Summary must not exceed 500 characters.')
+  } else {
+    const unbrokenTextError = validateUnbrokenTextRun(input.summary, 'Summary')
+    if (unbrokenTextError) {
+      errors.push(unbrokenTextError)
+    }
   }
 
   // Body validation: readable text length plus markup size
@@ -441,6 +544,11 @@ function validateArticleInput(input) {
       )
     }
 
+    const unbrokenTextError = validateUnbrokenTextRun(plainText, 'Article body')
+    if (unbrokenTextError) {
+      errors.push(unbrokenTextError)
+    }
+
     const htmlLengthWithoutUploadedImages = stripBase64Images(input.bodyHtml).length
     if (htmlLengthWithoutUploadedImages > ARTICLE_LIMITS.htmlMaxCharacters) {
       errors.push(
@@ -452,6 +560,11 @@ function validateArticleInput(input) {
   // Cover label validation: max 100 chars
   if (input.coverLabel && input.coverLabel.length > 100) {
     errors.push('Cover label must not exceed 100 characters.')
+  } else if (input.coverLabel) {
+    const unbrokenTextError = validateUnbrokenTextRun(input.coverLabel, 'Cover label')
+    if (unbrokenTextError) {
+      errors.push(unbrokenTextError)
+    }
   }
 
   const tags = Array.isArray(input.tags)
@@ -724,7 +837,7 @@ function canManageDraft(draft, user) {
 async function fetchArticleCollection(query = {}, viewerId = null, options = {}) {
   const articlesQuery = Article.find(query)
     .sort(options.sort || { publishedAt: -1 })
-    .select('-likedBy -viewCount -toc -bodyHtml')
+    .select('-likedBy -viewCount -toc -bodyHtml -coverImage')
     .lean()
 
   if (options.skip !== undefined) {
@@ -746,8 +859,167 @@ async function fetchArticleCollection(query = {}, viewerId = null, options = {})
       profileMap,
       viewerId,
       includeBody: Boolean(options.includeBody),
+      includeCoverImage: false,
+      coverImageMaxCharacters: LIST_COVER_IMAGE_MAX_CHARACTERS,
     }),
   )
+}
+
+const publicArticleDetailBuilds = new Map()
+const publicArticleCommentsBuilds = new Map()
+
+function shouldIncludeRelatedArticles(request) {
+  return ['1', 'true', 'yes'].includes(
+    String(request.query.includeRelated || '').trim().toLowerCase(),
+  )
+}
+
+function getArticleDetailVariant(includeRelated) {
+  return includeRelated ? 'related' : 'base'
+}
+
+async function buildArticleDetailResponse(slug, { viewer = null, includeRelated = false } = {}) {
+  const article = await Article.findOne({ slug })
+    .select('-likedBy')
+    .lean()
+
+  if (!article || !canViewArticle(article, viewer)) {
+    return null
+  }
+
+  const relatedArticleQuery =
+    includeRelated && Array.isArray(article.tags) && article.tags.length
+      ? Article.find({
+          _id: { $ne: article._id },
+          publicationStatus: PUBLICATION_STATUS.PUBLISHED,
+          tags: { $in: article.tags },
+        })
+          .select('slug title summary author domain coverLabel tags publishedAt readTime likeCount commentCount isFeatured publicationStatus')
+          .sort({ viewCount: -1 })
+          .limit(3)
+          .lean()
+      : Promise.resolve([])
+
+  const [relatedArticles, totalComments] = await Promise.all([
+    relatedArticleQuery,
+    getArticleCommentCount(article),
+  ])
+
+  const profileMap = await buildProfileMap([
+    article.author,
+    ...relatedArticles.map((entry) => entry.author),
+  ])
+
+  const payload = {
+    article: serializeArticle(article, {
+      profileMap,
+      viewerId: viewer?._id,
+      includeBody: true,
+      coverImageMaxCharacters: LIST_COVER_IMAGE_MAX_CHARACTERS,
+    }),
+    relatedArticles: relatedArticles.map((entry) =>
+      serializeArticle(entry, {
+        profileMap,
+        viewerId: viewer?._id,
+        includeCoverImage: false,
+        coverImageMaxCharacters: LIST_COVER_IMAGE_MAX_CHARACTERS,
+      }),
+    ),
+    totalComments,
+  }
+
+  return {
+    payload,
+    articleId: article._id,
+    isPubliclyVisible: isArticlePubliclyVisible(article),
+  }
+}
+
+async function getPublicArticleDetailResponse(slug, includeRelated = false) {
+  const variant = getArticleDetailVariant(includeRelated)
+  const cachedDetail = await getCachedArticleDetail(slug, variant)
+
+  if (cachedDetail) {
+    return {
+      cacheStatus: 'HIT',
+      detail: {
+        payload: cachedDetail,
+        articleId: cachedDetail.article?.id,
+        isPubliclyVisible: true,
+      },
+    }
+  }
+
+  const buildKey = `${variant}:${slug}`
+  const pendingBuild = publicArticleDetailBuilds.get(buildKey)
+
+  if (pendingBuild) {
+    return {
+      cacheStatus: 'WAIT',
+      detail: await pendingBuild,
+    }
+  }
+
+  const buildPromise = buildArticleDetailResponse(slug, { includeRelated })
+    .then(async (detail) => {
+      if (detail?.isPubliclyVisible) {
+        await cacheArticleDetail(detail.payload, slug, ARTICLE_DETAIL_CACHE_SECONDS, variant)
+      }
+
+      return detail
+    })
+    .finally(() => {
+      publicArticleDetailBuilds.delete(buildKey)
+    })
+
+  publicArticleDetailBuilds.set(buildKey, buildPromise)
+
+  return {
+    cacheStatus: 'MISS',
+    detail: await buildPromise,
+  }
+}
+
+async function buildArticleCommentsResponse(articleId, page, limit, skip, viewerId = null) {
+  const article = await Article.findById(articleId)
+    .select('publicationStatus isDraft commentCount')
+    .lean()
+
+  if (!article) {
+    return null
+  }
+
+  const [comments, totalComments] = await Promise.all([
+    Comment.find({ article: article._id })
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit)
+      .select('-__v')
+      .lean(),
+    getArticleCommentCount(article),
+  ])
+
+  const profileMap = await buildProfileMap(
+    comments.map((entry) => entry.author),
+  )
+
+  const payload = {
+    comments: comments.map((entry) =>
+      serializeComment(entry, {
+        profileMap,
+        viewerId,
+      }),
+    ),
+    totalComments,
+    page,
+    limit,
+    totalPages: Math.ceil(totalComments / limit),
+  }
+
+  return {
+    payload,
+    isPubliclyVisible: isArticlePubliclyVisible(article),
+  }
 }
 
 async function fetchDraftCollection(query = {}, viewerId = null, options = {}) {
@@ -1024,6 +1296,41 @@ app.use((request, response, next) => {
 
   if (request.originalUrl.startsWith('/api/')) {
     response.set('X-API-Version', API_VERSION)
+  }
+
+  next()
+})
+app.use((request, response, next) => {
+  const originalJson = response.json.bind(response)
+
+  response.json = (body) => {
+    if (response.headersSent || request.method === 'HEAD') {
+      return originalJson(body)
+    }
+
+    const acceptsEncoding = String(request.headers['accept-encoding'] || '')
+    if (!/\bgzip\b/i.test(acceptsEncoding)) {
+      return originalJson(body)
+    }
+
+    const payload = Buffer.from(JSON.stringify(body))
+    if (payload.byteLength < JSON_COMPRESSION_MIN_BYTES) {
+      return originalJson(body)
+    }
+
+    zlib.gzip(payload, { level: zlib.constants.Z_BEST_SPEED }, (error, compressedPayload) => {
+      if (error) {
+        originalJson(body)
+        return
+      }
+
+      response.set('Content-Encoding', 'gzip')
+      response.set('Content-Type', 'application/json; charset=utf-8')
+      response.set('Vary', 'Accept-Encoding')
+      response.send(compressedPayload)
+    })
+
+    return response
   }
 
   next()
@@ -1306,11 +1613,7 @@ app.get(
     const domain = (request.query.topic || request.query.domain)?.trim()
     const authorHandle = request.query.author?.trim()
     const page = Math.max(1, Number(request.query.page) || 1)
-    const limit = request.query.limit
-      ? Number(request.query.limit)
-      : request.query.page
-      ? 10
-      : 30
+    const limit = PUBLIC_ARTICLES_PER_PAGE
     const sortParam = String(request.query.sort || 'recent').trim().toLowerCase()
 
     // Try to get from cache only if no search and no author filter (most common case)
@@ -1357,7 +1660,7 @@ app.get(
 
     if (search) {
       const searchableArticles = await Article.find(query)
-        .select('-bodyHtml -toc')
+        .select('-bodyHtml -toc -coverImage -likedBy')
         .lean()
       const rankedArticles = rankArticlesByBm25(searchableArticles, search)
       const paginatedArticles = rankedArticles.slice(skip, skip + limit)
@@ -1370,6 +1673,8 @@ app.get(
           serializeArticle(article, {
             profileMap,
             viewerId: request.user?._id,
+            includeCoverImage: false,
+            coverImageMaxCharacters: LIST_COVER_IMAGE_MAX_CHARACTERS,
           }),
         ),
         totalCount: rankedArticles.length,
@@ -1383,12 +1688,14 @@ app.get(
       return
     }
 
-    const totalCount = await Article.countDocuments(query)
-    const articles = await fetchArticleCollection(query, request.user?._id, {
-      sort: sortOption,
-      skip,
-      limit,
-    })
+    const [totalCount, articles] = await Promise.all([
+      Article.countDocuments(query),
+      fetchArticleCollection(query, request.user?._id, {
+        sort: sortOption,
+        skip,
+        limit,
+      }),
+    ])
 
     const result = {
       articles,
@@ -1647,65 +1954,41 @@ app.get(
   '/api/articles/:slug',
   optionalAuth,
   asyncHandler(async (request, response) => {
-    const article = await Article.findOne({ slug: request.params.slug })
-      .select('-likedBy')
-      .lean()
+    const slug = request.params.slug
+    const includeRelated = shouldIncludeRelatedArticles(request)
+    const canUsePublicCache = !request.user
 
-    if (!article || !canViewArticle(article, request.user)) {
+    if (canUsePublicCache) {
+      const { cacheStatus, detail } = await getPublicArticleDetailResponse(slug, includeRelated)
+
+      if (!detail) {
+        response.status(404).json({ message: 'Article not found.' })
+        return
+      }
+
+      recordArticleView(detail.articleId)
+      response.set('Cache-Control', `public, max-age=${Math.min(300, ARTICLE_DETAIL_CACHE_SECONDS)}`)
+      response.set('X-Cache', cacheStatus)
+      response.json(detail.payload)
+      return
+    }
+
+    const detail = await buildArticleDetailResponse(slug, {
+      viewer: request.user,
+      includeRelated,
+    })
+
+    if (!detail) {
       response.status(404).json({ message: 'Article not found.' })
       return
     }
 
-    if (isArticlePubliclyVisible(article)) {
-      await Article.findByIdAndUpdate(article._id, { $inc: { viewCount: 1 } })
+    if (detail.isPubliclyVisible) {
+      recordArticleView(detail.articleId)
     }
 
-    const [comments, totalComments, relatedArticles] = await Promise.all([
-      Comment.find({ article: article._id })
-        .sort({ createdAt: -1 })
-        .limit(10)
-        .select('-__v')
-        .lean(),
-      Comment.countDocuments({ article: article._id }),
-      // Fetch related articles by tags
-      Article.find({
-        _id: { $ne: article._id },
-        publicationStatus: 'published',
-        tags: { $in: article.tags },
-      })
-        .select('-likedBy -bodyHtml')
-        .sort({ viewCount: -1 })
-        .limit(6)
-        .lean(),
-    ])
-
-    const allUserIds = [
-      article.author,
-      ...comments.map((entry) => entry.author),
-      ...relatedArticles.map((entry) => entry.author),
-    ].filter((id) => id)
-    const profileMap = await buildProfileMap(allUserIds)
-
-    response.json({
-      article: serializeArticle(article, {
-        profileMap,
-        viewerId: request.user?._id,
-        includeBody: true,
-      }),
-      relatedArticles: relatedArticles.map((entry) =>
-        serializeArticle(entry, {
-          profileMap,
-          viewerId: request.user?._id,
-        }),
-      ),
-      comments: comments.map((entry) =>
-        serializeComment(entry, {
-          profileMap,
-          viewerId: request.user?._id,
-        }),
-      ),
-      totalComments,
-    })
+    response.set('X-Cache', 'BYPASS')
+    response.json(detail.payload)
   }),
 )
 
@@ -1713,58 +1996,59 @@ app.get(
   '/api/articles/:id/comments',
   optionalAuth,
   asyncHandler(async (request, response) => {
-    const article = await Article.findById(request.params.id).lean()
+    const page = Math.max(1, Number(request.query.page) || 1)
+    const limit = Math.min(50, Math.max(1, Number(request.query.limit) || 10))
+    const skip = (page - 1) * limit
+    const cacheKey = `${request.params.id}:p${page}:l${limit}`
 
-    if (!article) {
+    const cachedComments = await getArticleComments(request.params.id, page, limit)
+    if (cachedComments) {
+      response.set('X-Cache', 'HIT')
+      return response.json(cachedComments)
+    }
+
+    const pendingBuild = publicArticleCommentsBuilds.get(cacheKey)
+    if (pendingBuild) {
+      const cachedResult = await pendingBuild
+
+      if (!cachedResult) {
+        response.status(404).json({ message: 'Article not found.' })
+        return
+      }
+
+      response.set('X-Cache', 'WAIT')
+      response.json(cachedResult.payload)
+      return
+    }
+
+    const buildPromise = buildArticleCommentsResponse(
+      request.params.id,
+      page,
+      limit,
+      skip,
+      request.user?._id,
+    )
+      .then(async (result) => {
+        if (result?.isPubliclyVisible) {
+          await cacheArticleComments(result.payload, request.params.id, page, limit)
+        }
+
+        return result
+      })
+      .finally(() => {
+        publicArticleCommentsBuilds.delete(cacheKey)
+      })
+
+    publicArticleCommentsBuilds.set(cacheKey, buildPromise)
+    const result = await buildPromise
+
+    if (!result) {
       response.status(404).json({ message: 'Article not found.' })
       return
     }
 
-    const page = Math.max(1, Number(request.query.page) || 1)
-    const limit = Math.min(50, Math.max(1, Number(request.query.limit) || 10))
-    const skip = (page - 1) * limit
-
-    // Try cache first for public articles
-    if (isArticlePubliclyVisible(article)) {
-      const cachedComments = await getArticleComments(request.params.id, page, limit)
-      if (cachedComments) {
-        return response.json(cachedComments)
-      }
-    }
-
-    const [comments, totalComments] = await Promise.all([
-      Comment.find({ article: article._id })
-        .sort({ createdAt: -1 })
-        .skip(skip)
-        .limit(limit)
-        .select('-__v')
-        .lean(),
-      Comment.countDocuments({ article: article._id }),
-    ])
-
-    const profileMap = await buildProfileMap(
-      comments.map((entry) => entry.author),
-    )
-
-    const result = {
-      comments: comments.map((entry) =>
-        serializeComment(entry, {
-          profileMap,
-          viewerId: request.user?._id,
-        }),
-      ),
-      totalComments,
-      page,
-      limit,
-      totalPages: Math.ceil(totalComments / limit),
-    }
-
-    // Cache result for public articles
-    if (isArticlePubliclyVisible(article)) {
-      await cacheArticleComments(result, request.params.id, page, limit)
-    }
-
-    response.json(result)
+    response.set('X-Cache', 'MISS')
+    response.json(result.payload)
   }),
 )
 
@@ -1876,6 +2160,7 @@ app.post(
 
     article.likeCount = article.likedBy.length
     await article.save()
+    await invalidateArticleDetailCache(article.slug)
 
     response.json({
       likeCount: article.likeCount,

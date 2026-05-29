@@ -252,8 +252,14 @@ describe('backend integration flows', () => {
       const singleResponse = await request(app).get(`/api/articles/${article.slug}`)
 
       expect(singleResponse.status).toBe(200)
-      expect(singleResponse.body.comments).toHaveLength(1)
+      expect(singleResponse.body.totalComments).toBe(1)
       expect(singleResponse.body.relatedArticles).toEqual([])
+
+      const commentsListResponse = await request(app)
+        .get(`/api/articles/${article.id}/comments?page=1&limit=10`)
+
+      expect(commentsListResponse.status).toBe(200)
+      expect(commentsListResponse.body.comments).toHaveLength(1)
 
       const deleteCommentResponse = await request(app)
         .delete(`/api/comments/${commentResponse.body.comment.id}`)
