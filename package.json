@@ -12,6 +12,7 @@
     "test:coverage": "jest --coverage",
     "test:report": "jest --coverage --reporters=default --reporters=jest-html-reporter",
     "test:smtp:smoke": "node scripts/smtp-smoke.js",
+    "migrate-images": "node scripts/migrate-images.js",
     "test:coverage:open": "jest --coverage && open coverage/index.html",
     "test:integration": "jest tests/integration.test.js --verbose",
     "test:unit": "jest tests/validations.test.js --verbose",

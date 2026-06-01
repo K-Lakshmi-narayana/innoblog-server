@@ -160,13 +160,25 @@ describe('backend validation helpers', () => {
         tags: ['Machine Learning', 'Model Evaluation', 'Feature Engineering'],
       })
 
-      expect(errors).toContain('Cover image must be 2 MB or smaller. Choose a smaller image.')
+      expect(errors).toContain('Cover image must be 10 MB or smaller. Choose a smaller image.')
 
       expect(
         validateArticleImages({
           bodyHtml: `<p>${'A'.repeat(160)}</p><img src="${buildDataImage(100, 'image/svg+xml')}" />`,
         }),
-      ).toContain('Article images must be JPEG, PNG, WebP, or GIF files.')
+      ).toContain('Article images must be JPEG, PNG, or WebP files.')
+
+      expect(
+        validateArticleImages({
+          coverImage: '/uploads/covers/cover.png',
+          bodyHtml: Array.from(
+            { length: ARTICLE_LIMITS.maxUploadedImages },
+            (_, index) => `<img src="/uploads/articles/${index}.png" />`,
+          ).join(''),
+        }),
+      ).toContain(
+        `Use up to ${ARTICLE_LIMITS.maxUploadedImages} uploaded images per article, including the cover image.`,
+      )
     })
   })
 

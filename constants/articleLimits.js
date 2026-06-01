@@ -5,18 +5,17 @@ const ARTICLE_LIMITS = {
   bodyMaxCharacters: 60000,
   htmlMaxCharacters: 150000,
   unbrokenTextMaxCharacters: 80,
-  imageMaxBytes: 2 * ONE_MB,
-  totalImageMaxBytes: 8 * ONE_MB,
+  imageMaxBytes: 10 * ONE_MB,
+  totalImageMaxBytes: 80 * ONE_MB,
   maxUploadedImages: 8,
-  requestJsonLimit: '12mb',
-  requestMaxBytes: 12 * ONE_MB,
+  requestJsonLimit: '16mb',
+  requestMaxBytes: 16 * ONE_MB,
 }
 
 const ALLOWED_ARTICLE_IMAGE_MIME_TYPES = [
   'image/jpeg',
   'image/png',
   'image/webp',
-  'image/gif',
 ]
 
 function formatBytes(bytes) {

@@ -2,7 +2,7 @@ import http from 'k6/http'
 import { check, group, sleep } from 'k6'
 import { textSummary } from 'https://jslib.k6.io/k6-summary/0.1.0/index.js'
 
-const BASE_URL = __ENV.BASE_URL || 'http://localhost:4000/api'
+const BASE_URL = __ENV.BASE_URL || 'http://127.0.0.1:4000/api'
 
 let articleSlugs = []
 let domainStats = []

@@ -1,3 +1,9 @@
 node_modules
 .env
 package-lock.json
+uploads/*
+!uploads/.gitkeep
+!uploads/covers/
+!uploads/covers/.gitkeep
+!uploads/articles/
+!uploads/articles/.gitkeep

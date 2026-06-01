@@ -1,5 +1,7 @@
 const request = require('supertest')
+const fs = require('fs')
 const mongoose = require('mongoose')
+const path = require('path')
 const { MongoMemoryServer } = require('mongodb-memory-server')
 
 jest.setTimeout(30000)
@@ -28,6 +30,15 @@ const Comment = require('../models/Comment')
 const Profile = require('../models/Profile')
 const VerificationCode = require('../models/VerificationCode')
 const PublicationRequest = require('../models/PublicationRequest')
+const SiteSetting = require('../models/SiteSetting')
+const { ARTICLE_LIMITS } = require('../constants/articleLimits')
+const { migrateImages } = require('../scripts/migrate-images')
+
+const ONE_PIXEL_PNG = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=',
+  'base64',
+)
+const ONE_PIXEL_PNG_DATA_URL = `data:image/png;base64,${ONE_PIXEL_PNG.toString('base64')}`
 
 let mongoServer
 let app
@@ -65,7 +76,25 @@ async function clearDatabase() {
     Profile.deleteMany({}),
     VerificationCode.deleteMany({}),
     PublicationRequest.deleteMany({}),
+    SiteSetting.deleteMany({}),
   ])
+}
+
+function resetUploadRoot() {
+  fs.rmSync(process.env.UPLOAD_ROOT, { recursive: true, force: true })
+  fs.mkdirSync(path.join(process.env.UPLOAD_ROOT, 'covers'), { recursive: true })
+  fs.mkdirSync(path.join(process.env.UPLOAD_ROOT, 'articles'), { recursive: true })
+}
+
+function getUploadFilePath(publicPath) {
+  return path.join(process.env.UPLOAD_ROOT, String(publicPath).replace(/^\/uploads\/?/, ''))
+}
+
+async function uploadImage(token, endpoint, filename = 'image.png') {
+  return request(app)
+    .post(endpoint)
+    .set('Authorization', `Bearer ${token}`)
+    .attach('image', ONE_PIXEL_PNG, { filename, contentType: 'image/png' })
 }
 
 async function authenticateUser({ email, name = 'Test User' }) {
@@ -119,6 +148,8 @@ beforeAll(async () => {
   process.env.MAIL_PASS = 'mail-password'
   process.env.JWT_SECRET = 'integration-test-secret'
   process.env.FRONTEND_URL = 'http://localhost:5173'
+  process.env.PUBLIC_API_URL = 'http://localhost:4000'
+  resetUploadRoot()
 
   await mongoose.connect(process.env.MONGODB_URI)
   ;({ app } = require('../index'))
@@ -126,12 +157,14 @@ beforeAll(async () => {
 
 afterEach(async () => {
   await clearDatabase()
+  resetUploadRoot()
   jest.clearAllMocks()
 })
 
 afterAll(async () => {
   await mongoose.disconnect()
   await mongoServer.stop()
+  fs.rmSync(process.env.UPLOAD_ROOT, { recursive: true, force: true })
 })
 
 describe('backend integration flows', () => {
@@ -330,6 +363,142 @@ describe('backend integration flows', () => {
 
       expect(invalidResponse.status).toBe(400)
       expect(invalidResponse.body.message).toContain('Title')
+    })
+
+    it('uploads, serves, updates, and deletes filesystem-backed article images', async () => {
+      const { token } = await authenticateAdmin()
+
+      const coverUploadResponse = await uploadImage(token, '/api/uploads/cover', 'cover.png')
+      expect(coverUploadResponse.status).toBe(201)
+      expect(coverUploadResponse.body.image.path).toMatch(/^\/uploads\/covers\/.+\.png$/)
+      expect(fs.existsSync(getUploadFilePath(coverUploadResponse.body.image.path))).toBe(true)
+
+      const bodyUploadResponse = await uploadImage(token, '/api/uploads/article-image', 'body.png')
+      expect(bodyUploadResponse.status).toBe(201)
+      expect(bodyUploadResponse.body.image.path).toMatch(/^\/uploads\/articles\/.+\.png$/)
+
+      const staticResponse = await request(app).get(coverUploadResponse.body.image.path)
+      expect(staticResponse.status).toBe(200)
+      expect(staticResponse.headers['content-type']).toContain('image/png')
+
+      const createResponse = await request(app)
+        .post('/api/articles')
+        .set('Authorization', `Bearer ${token}`)
+        .send(
+          buildArticlePayload({
+            title: 'Image Storage Article',
+            coverImage: coverUploadResponse.body.image.url,
+            body: `<p>${'Image storage article body '.repeat(10)}</p><img src="${bodyUploadResponse.body.image.url}" />`,
+          }),
+        )
+
+      expect(createResponse.status).toBe(201)
+      expect(createResponse.body.article.coverImage).toBe(coverUploadResponse.body.image.url)
+      expect(createResponse.body.article.bodyHtml).toContain(bodyUploadResponse.body.image.url)
+
+      const listResponse = await request(app).get('/api/articles')
+      expect(listResponse.status).toBe(200)
+      expect(listResponse.body.articles[0].coverImage).toBe(coverUploadResponse.body.image.url)
+
+      const searchResponse = await request(app).get('/api/articles?search=storage')
+      expect(searchResponse.status).toBe(200)
+      expect(searchResponse.body.articles[0].coverImage).toBe(coverUploadResponse.body.image.url)
+
+      const storedArticle = await Article.findById(createResponse.body.article.id).lean()
+      expect(storedArticle.coverImage).toBe(coverUploadResponse.body.image.path)
+      expect(storedArticle.bodyHtml).toContain(bodyUploadResponse.body.image.path)
+      expect(storedArticle.bodyHtml).not.toContain('http://localhost:4000/uploads')
+
+      const replacementCoverResponse = await uploadImage(token, '/api/uploads/cover', 'replacement.png')
+      expect(replacementCoverResponse.status).toBe(201)
+
+      const updateResponse = await request(app)
+        .patch(`/api/articles/${createResponse.body.article.id}`)
+        .set('Authorization', `Bearer ${token}`)
+        .send(
+          buildArticlePayload({
+            title: 'Image Storage Article Updated',
+            coverImage: replacementCoverResponse.body.image.url,
+            body: `<p>${'Image storage article body updated '.repeat(10)}</p><img src="${bodyUploadResponse.body.image.url}" />`,
+          }),
+        )
+
+      expect(updateResponse.status).toBe(200)
+      expect(updateResponse.body.article.coverImage).toBe(replacementCoverResponse.body.image.url)
+      expect(fs.existsSync(getUploadFilePath(coverUploadResponse.body.image.path))).toBe(false)
+      expect(fs.existsSync(getUploadFilePath(replacementCoverResponse.body.image.path))).toBe(true)
+      expect(fs.existsSync(getUploadFilePath(bodyUploadResponse.body.image.path))).toBe(true)
+
+      const deleteResponse = await request(app)
+        .delete(`/api/articles/${createResponse.body.article.id}`)
+        .set('Authorization', `Bearer ${token}`)
+
+      expect(deleteResponse.status).toBe(200)
+      expect(fs.existsSync(getUploadFilePath(replacementCoverResponse.body.image.path))).toBe(false)
+      expect(fs.existsSync(getUploadFilePath(bodyUploadResponse.body.image.path))).toBe(false)
+    })
+
+    it('rejects invalid and oversized image uploads', async () => {
+      const { token } = await authenticateAdmin()
+
+      const invalidTypeResponse = await request(app)
+        .post('/api/uploads/article-image')
+        .set('Authorization', `Bearer ${token}`)
+        .attach('image', Buffer.from('<svg></svg>'), {
+          filename: 'diagram.svg',
+          contentType: 'image/svg+xml',
+        })
+
+      expect(invalidTypeResponse.status).toBe(400)
+      expect(invalidTypeResponse.body.message).toContain('JPEG, PNG, or WebP')
+
+      const oversizedResponse = await request(app)
+        .post('/api/uploads/cover')
+        .set('Authorization', `Bearer ${token}`)
+        .attach('image', Buffer.alloc(ARTICLE_LIMITS.imageMaxBytes + 1), {
+          filename: 'huge.png',
+          contentType: 'image/png',
+        })
+
+      expect(oversizedResponse.status).toBe(413)
+      expect(oversizedResponse.body.message).toContain('10 MB or smaller')
+    })
+
+    it('migrates legacy image data URLs into stable filesystem paths', async () => {
+      const { user } = await authenticateAdmin()
+
+      const legacyArticle = await Article.create({
+        author: user._id,
+        title: 'Legacy Image Article',
+        slug: 'legacy-image-article',
+        summary: 'A legacy article that still stores data URLs.',
+        domain: 'cv',
+        coverLabel: 'CV',
+        coverImage: ONE_PIXEL_PNG_DATA_URL,
+        tags: testTagsByDomain.cv,
+        bodyHtml: `<p>${'Legacy image body '.repeat(10)}</p><img src="${ONE_PIXEL_PNG_DATA_URL}" />`,
+        toc: [],
+        publishedAt: new Date(),
+        readTime: '1 min read',
+        publicationStatus: 'published',
+      })
+
+      const firstRun = await migrateImages()
+      const migratedArticle = await Article.findById(legacyArticle._id).lean()
+
+      expect(firstRun.find((summary) => summary.collection === 'articles').updated).toBe(1)
+      expect(migratedArticle.coverImage).toMatch(/^\/uploads\/covers\/.+\.png$/)
+      expect(migratedArticle.bodyHtml).toContain('/uploads/articles/')
+      expect(migratedArticle.bodyHtml).not.toContain('data:image')
+      expect(fs.existsSync(getUploadFilePath(migratedArticle.coverImage))).toBe(true)
+
+      const imageFileCount = fs.readdirSync(path.join(process.env.UPLOAD_ROOT, 'articles')).length
+      const coverFileCount = fs.readdirSync(path.join(process.env.UPLOAD_ROOT, 'covers')).length
+      const secondRun = await migrateImages()
+
+      expect(secondRun.every((summary) => summary.updated === 0)).toBe(true)
+      expect(fs.readdirSync(path.join(process.env.UPLOAD_ROOT, 'articles'))).toHaveLength(imageFileCount)
+      expect(fs.readdirSync(path.join(process.env.UPLOAD_ROOT, 'covers'))).toHaveLength(coverFileCount)
     })
   })
 
@@ -663,6 +832,26 @@ describe('backend integration flows', () => {
       expect(metricsResponse.body.totalReaders).toBeGreaterThanOrEqual(1)
       expect(await User.findById(readerUser._id)).not.toBeNull()
       expect(await User.findById(authorUser._id)).not.toBeNull()
+
+      const settingsResponse = await request(app)
+        .get('/api/v1/admin/settings')
+        .set('Authorization', `Bearer ${adminToken}`)
+
+      expect(settingsResponse.status).toBe(200)
+      expect(settingsResponse.body.readingAdsEnabled).toBe(true)
+
+      const updateSettingsResponse = await request(app)
+        .patch('/api/v1/admin/settings')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ readingAdsEnabled: false })
+
+      expect(updateSettingsResponse.status).toBe(200)
+      expect(updateSettingsResponse.body.readingAdsEnabled).toBe(false)
+
+      const publicSettingsResponse = await request(app).get('/api/v1/settings/public')
+
+      expect(publicSettingsResponse.status).toBe(200)
+      expect(publicSettingsResponse.body.readingAdsEnabled).toBe(false)
     })
   })
 

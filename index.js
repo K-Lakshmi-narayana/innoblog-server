@@ -35,11 +35,29 @@ const Profile = require('./models/Profile')
 const User = require('./models/User')
 const VerificationCode = require('./models/VerificationCode')
 const { ensureAdminAccount, ensureProfileForUser, upsertUserByEmail } = require('./services/userService')
+const {
+  cleanupImages,
+  collectImagePathsFromHtml,
+  convertDataUrlImagesInHtml,
+  createImageUploadMiddleware,
+  deleteImage,
+  deleteImagesFromHtml,
+  ensureUploadDirectories,
+  ensureUploadDirectoriesSync,
+  getImageUrl,
+  getPublicPathFromAbsolutePath,
+  getUploadRoot,
+  normalizeStoredImagePath,
+  rewriteImageUrlsToStoredPaths,
+  saveDataUrlImage,
+  validateStoredImageFile,
+} = require('./services/storage')
 const { buildArticleContent, buildSummary, stripBase64Images } = require('./utils/articleUtils')
 const { sendEmail, sendOtpEmail, sendWriterAccessGrantedEmail, sendWriterAccessRevokedEmail } = require('./utils/mail')
 const PublishRequest = require('./models/PublishRequest')
 const PublicationRequest = require('./models/PublicationRequest')
 const SuggestionRequest = require('./models/SuggestionRequest')
+const SiteSetting = require('./models/SiteSetting')
 const {
   buildProfileMap,
   hasId,
@@ -86,11 +104,15 @@ const LIST_COVER_IMAGE_MAX_CHARACTERS = 20_000
 const ARTICLE_VIEW_FLUSH_INTERVAL_MS = Number(process.env.ARTICLE_VIEW_FLUSH_INTERVAL_MS || 10000)
 const ARTICLE_DETAIL_CACHE_SECONDS = Number(process.env.ARTICLE_DETAIL_CACHE_SECONDS || 600)
 const JSON_COMPRESSION_MIN_BYTES = Number(process.env.JSON_COMPRESSION_MIN_BYTES || 1024)
+const API_PREFIXES = ['/api', `/api/${API_VERSION}`]
+
+ensureUploadDirectoriesSync()
 
 // Simple cache for domain stats (30 second TTL)
 let domainStatsCache = null
 let domainStatsCacheTime = 0
 const DOMAIN_STATS_CACHE_TTL = 30000 // 30 seconds
+const SITE_SETTINGS_KEY = 'global'
 
 class AppError extends Error {
   constructor(statusCode, message, options = {}) {
@@ -112,6 +134,11 @@ function ensure(condition, message, statusCode = 400, code = 'BAD_REQUEST', deta
   if (!condition) {
     throw new AppError(statusCode, message, { code, details })
   }
+}
+
+function apiPaths(path) {
+  const normalizedPath = String(path || '').startsWith('/') ? path : `/${path || ''}`
+  return API_PREFIXES.map((prefix) => `${prefix}${normalizedPath}`)
 }
 
 const pendingArticleViews = new Map()
@@ -193,6 +220,18 @@ function sendRequestError(response, error, fallbackStatusCode = 400) {
         }
       : {}),
   })
+}
+
+async function getSiteSettings() {
+  const settings = await SiteSetting.findOneAndUpdate(
+    { key: SITE_SETTINGS_KEY },
+    { $setOnInsert: { readingAdsEnabled: true } },
+    { returnDocument: 'after', upsert: true, setDefaultsOnInsert: true },
+  ).lean()
+
+  return {
+    readingAdsEnabled: settings?.readingAdsEnabled !== false,
+  }
 }
 
 function validateEmail(value = '') {
@@ -417,10 +456,10 @@ function getDataUrlImageInfo(dataUrl = '') {
   }
 }
 
-function getEmbeddedDataImages(bodyHtml = '') {
+function getEmbeddedArticleImages(bodyHtml = '') {
   const embeddedImages = []
   const sourceHtml = String(bodyHtml || '')
-  const imageRegex = /<img\b[^>]*\bsrc=(["'])(data:[^"']+)\1[^>]*>/gi
+  const imageRegex = /<img\b[^>]*\bsrc=(["'])([^"']+)\1[^>]*>/gi
   let match = imageRegex.exec(sourceHtml)
 
   while (match) {
@@ -438,12 +477,12 @@ function validateArticleImageDataUrl(dataUrl, label) {
   if (!imageInfo) {
     return {
       byteSize: 0,
-      errors: [`${label} could not be read. Upload it again as a JPEG, PNG, WebP, or GIF image.`],
+      errors: [`${label} could not be read. Upload it again as a JPEG, PNG, or WebP image.`],
     }
   }
 
   if (!ALLOWED_ARTICLE_IMAGE_MIME_TYPES.includes(imageInfo.mimeType)) {
-    errors.push('Article images must be JPEG, PNG, WebP, or GIF files.')
+    errors.push('Article images must be JPEG, PNG, or WebP files.')
   }
 
   if (imageInfo.byteSize > ARTICLE_LIMITS.imageMaxBytes) {
@@ -463,14 +502,14 @@ function validateArticleImages(input = {}) {
   const imageEntries = []
   const coverImage = String(input.coverImage || '').trim()
 
-  if (/^data:/i.test(coverImage)) {
+  if (coverImage) {
     imageEntries.push({
       label: 'Cover image',
       src: coverImage,
     })
   }
 
-  getEmbeddedDataImages(input.bodyHtml).forEach((src, index) => {
+  getEmbeddedArticleImages(input.bodyHtml).forEach((src, index) => {
     imageEntries.push({
       label: `Article image ${index + 1}`,
       src,
@@ -483,7 +522,11 @@ function validateArticleImages(input = {}) {
     )
   }
 
-  const totalImageBytes = imageEntries.reduce((total, imageEntry) => {
+  const dataUrlImageEntries = imageEntries.filter((imageEntry) =>
+    /^data:/i.test(String(imageEntry.src || '')),
+  )
+
+  const totalImageBytes = dataUrlImageEntries.reduce((total, imageEntry) => {
     const validation = validateArticleImageDataUrl(imageEntry.src, imageEntry.label)
     errors.push(...validation.errors)
     return total + validation.byteSize
@@ -603,6 +646,93 @@ function ensureValidArticleInput(input) {
   if (validationErrors.length > 0) {
     ensure(false, validationErrors[0], 400, 'VALIDATION_ERROR', { validationErrors })
   }
+}
+
+async function normalizeArticleImagesForStorage(input = {}, options = {}) {
+  const filenameHint = options.filenameHint || slugify(input.title || 'article')
+  const createdPaths = []
+  let coverImage = normalizeStoredImagePath(input.coverImage || '')
+
+  if (/^data:/i.test(coverImage)) {
+    const savedCover = await saveDataUrlImage(coverImage, {
+      kind: 'covers',
+      filenameHint: `${filenameHint}-cover`,
+    })
+    coverImage = savedCover.path
+    createdPaths.push(savedCover.path)
+  }
+
+  const convertedBody = await convertDataUrlImagesInHtml(input.bodyHtml || input.body || '', {
+    filenameHint,
+  })
+
+  createdPaths.push(...convertedBody.createdPaths)
+
+  return {
+    coverImage,
+    bodyHtml: convertedBody.bodyHtml,
+    createdPaths,
+  }
+}
+
+function getRemovedLocalImages(previousInput = {}, nextInput = {}) {
+  const previousCover = normalizeStoredImagePath(previousInput.coverImage || '')
+  const nextCover = normalizeStoredImagePath(nextInput.coverImage || '')
+  const removedImages = new Set()
+
+  if (previousCover && previousCover !== nextCover && previousCover.startsWith('/uploads/')) {
+    removedImages.add(previousCover)
+  }
+
+  const previousBodyImages = collectImagePathsFromHtml(previousInput.bodyHtml || '')
+  const nextBodyImages = new Set(collectImagePathsFromHtml(nextInput.bodyHtml || ''))
+
+  previousBodyImages.forEach((imagePath) => {
+    if (!nextBodyImages.has(imagePath)) {
+      removedImages.add(imagePath)
+    }
+  })
+
+  return [...removedImages]
+}
+
+async function deleteContentDocumentImages(document) {
+  await Promise.all([
+    deleteImage(document?.coverImage || ''),
+    deleteImagesFromHtml(document?.bodyHtml || ''),
+  ])
+}
+
+async function handleImageUpload(request, response, uploadMiddleware, kind) {
+  await new Promise((resolve, reject) => {
+    uploadMiddleware.single('image')(request, response, (error) => {
+      if (error) {
+        reject(error)
+        return
+      }
+
+      resolve()
+    })
+  })
+
+  ensure(request.file, 'Image file is required.', 400, 'VALIDATION_ERROR')
+
+  try {
+    await validateStoredImageFile(request.file.path, request.file.mimetype)
+  } catch (error) {
+    await deleteImage(getPublicPathFromAbsolutePath(request.file.path))
+    throw new AppError(400, error.message, { code: 'VALIDATION_ERROR' })
+  }
+
+  const imagePath = getPublicPathFromAbsolutePath(request.file.path)
+
+  response.status(201).json({
+    image: {
+      path: imagePath,
+      url: getImageUrl(imagePath),
+      kind,
+    },
+  })
 }
 
 function validateCommentInput(body) {
@@ -837,7 +967,7 @@ function canManageDraft(draft, user) {
 async function fetchArticleCollection(query = {}, viewerId = null, options = {}) {
   const articlesQuery = Article.find(query)
     .sort(options.sort || { publishedAt: -1 })
-    .select('-likedBy -viewCount -toc -bodyHtml -coverImage')
+    .select('-likedBy -viewCount -toc -bodyHtml')
     .lean()
 
   if (options.skip !== undefined) {
@@ -859,7 +989,6 @@ async function fetchArticleCollection(query = {}, viewerId = null, options = {})
       profileMap,
       viewerId,
       includeBody: Boolean(options.includeBody),
-      includeCoverImage: false,
       coverImageMaxCharacters: LIST_COVER_IMAGE_MAX_CHARACTERS,
     }),
   )
@@ -894,7 +1023,7 @@ async function buildArticleDetailResponse(slug, { viewer = null, includeRelated 
           publicationStatus: PUBLICATION_STATUS.PUBLISHED,
           tags: { $in: article.tags },
         })
-          .select('slug title summary author domain coverLabel tags publishedAt readTime likeCount commentCount isFeatured publicationStatus')
+          .select('slug title summary author domain coverLabel coverImage tags publishedAt readTime likeCount commentCount isFeatured publicationStatus')
           .sort({ viewCount: -1 })
           .limit(3)
           .lean()
@@ -921,7 +1050,6 @@ async function buildArticleDetailResponse(slug, { viewer = null, includeRelated 
       serializeArticle(entry, {
         profileMap,
         viewerId: viewer?._id,
-        includeCoverImage: false,
         coverImageMaxCharacters: LIST_COVER_IMAGE_MAX_CHARACTERS,
       }),
     ),
@@ -1082,51 +1210,80 @@ function buildDraftPayloadFromContent(input, existingDraft = null) {
 }
 
 async function saveDraftFromRequest(input, user, existingDraft = null) {
-  const { data, error } = buildDraftPayloadFromContent(input, existingDraft)
-
-  if (error) {
-    throw new AppError(400, error, { code: 'VALIDATION_ERROR' })
-  }
-
-  // Validate the complete article input with comprehensive checks
-  ensureValidArticleInput({
-    title: data.title,
-    summary: data.summary,
-    bodyHtml: data.bodyHtml,
-    coverLabel: data.coverLabel,
-    coverImage: data.coverImage,
-    domain: data.domain,
-    tags: data.tags,
+  const normalizedImages = await normalizeArticleImagesForStorage({
+    title: input.title,
+    coverImage: input.coverImage,
+    bodyHtml: input.body,
   })
 
-  const draft = existingDraft || new Draft()
-  draft.author = existingDraft?.author || user._id
-  draft.title = data.title
-  draft.slug = existingDraft?.slug || (await createUniqueDraftSlug(data.title))
-  draft.summary = data.summary
-  draft.domain = data.domain
-  draft.coverLabel = data.coverLabel
-  draft.coverImage = data.coverImage
-  draft.tags = data.tags
-  draft.bodyHtml = data.bodyHtml
-  draft.toc = data.toc
-  draft.readTime = data.readTime
+  try {
+    const { data, error } = buildDraftPayloadFromContent(
+      {
+        ...input,
+        coverImage: normalizedImages.coverImage,
+        body: normalizedImages.bodyHtml,
+      },
+      existingDraft,
+    )
 
-  if (!existingDraft || input.saveAsDraft === true) {
-    draft.publicationStatus =
-      existingDraft?.publicationStatus === PUBLICATION_STATUS.REJECTED
-        ? PUBLICATION_STATUS.REJECTED
-        : PUBLICATION_STATUS.DRAFT
-
-    if (draft.publicationStatus !== PUBLICATION_STATUS.REJECTED) {
-      draft.publicationNotes = ''
-      draft.publicationReviewedBy = null
-      draft.publicationReviewDate = null
+    if (error) {
+      throw new AppError(400, error, { code: 'VALIDATION_ERROR' })
     }
-  }
 
-  await draft.save()
-  return draft
+    // Validate the complete article input with comprehensive checks
+    ensureValidArticleInput({
+      title: data.title,
+      summary: data.summary,
+      bodyHtml: data.bodyHtml,
+      coverLabel: data.coverLabel,
+      coverImage: data.coverImage,
+      domain: data.domain,
+      tags: data.tags,
+    })
+
+    const previousImages = existingDraft
+      ? {
+          coverImage: existingDraft.coverImage,
+          bodyHtml: existingDraft.bodyHtml,
+        }
+      : null
+    const draft = existingDraft || new Draft()
+    draft.author = existingDraft?.author || user._id
+    draft.title = data.title
+    draft.slug = existingDraft?.slug || (await createUniqueDraftSlug(data.title))
+    draft.summary = data.summary
+    draft.domain = data.domain
+    draft.coverLabel = data.coverLabel
+    draft.coverImage = data.coverImage
+    draft.tags = data.tags
+    draft.bodyHtml = data.bodyHtml
+    draft.toc = data.toc
+    draft.readTime = data.readTime
+
+    if (!existingDraft || input.saveAsDraft === true) {
+      draft.publicationStatus =
+        existingDraft?.publicationStatus === PUBLICATION_STATUS.REJECTED
+          ? PUBLICATION_STATUS.REJECTED
+          : PUBLICATION_STATUS.DRAFT
+
+      if (draft.publicationStatus !== PUBLICATION_STATUS.REJECTED) {
+        draft.publicationNotes = ''
+        draft.publicationReviewedBy = null
+        draft.publicationReviewDate = null
+      }
+    }
+
+    await draft.save()
+
+    if (previousImages) {
+      await cleanupImages(getRemovedLocalImages(previousImages, draft))
+    }
+
+    return draft
+  } catch (error) {
+    await cleanupImages(normalizedImages.createdPaths)
+    throw error
+  }
 }
 
 async function clearPendingPublicationRequestsForDraft(draftId) {
@@ -1288,6 +1445,14 @@ app.use(
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
   }),
 )
+app.use(
+  '/uploads',
+  express.static(getUploadRoot(), {
+    fallthrough: true,
+    immutable: true,
+    maxAge: process.env.NODE_ENV === 'production' ? '30d' : 0,
+  }),
+)
 app.use(express.json({ limit: ARTICLE_LIMITS.requestJsonLimit }))
 app.use((request, response, next) => {
   if (request.originalUrl === `/api/${API_VERSION}` || request.originalUrl.startsWith(`/api/${API_VERSION}/`)) {
@@ -1343,6 +1508,47 @@ app.get(
       ok: true,
       apiVersion: API_VERSION,
       database: mongoose.connection.readyState === 1 ? 'connected' : 'connecting',
+    })
+  }),
+)
+
+app.get(
+  apiPaths('/settings/public'),
+  asyncHandler(async (request, response) => {
+    response.json(await getSiteSettings())
+  }),
+)
+
+app.get(
+  apiPaths('/admin/settings'),
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (request, response) => {
+    response.json(await getSiteSettings())
+  }),
+)
+
+app.patch(
+  apiPaths('/admin/settings'),
+  requireAuth,
+  requireAdmin,
+  asyncHandler(async (request, response) => {
+    ensure(
+      typeof request.body.readingAdsEnabled === 'boolean',
+      'Reading ads setting must be true or false.',
+      400,
+      'VALIDATION_ERROR',
+    )
+
+    const readingAdsEnabled = request.body.readingAdsEnabled
+    const settings = await SiteSetting.findOneAndUpdate(
+      { key: SITE_SETTINGS_KEY },
+      { $set: { readingAdsEnabled } },
+      { returnDocument: 'after', upsert: true, setDefaultsOnInsert: true },
+    ).lean()
+
+    response.json({
+      readingAdsEnabled: settings?.readingAdsEnabled !== false,
     })
   }),
 )
@@ -1660,7 +1866,7 @@ app.get(
 
     if (search) {
       const searchableArticles = await Article.find(query)
-        .select('-bodyHtml -toc -coverImage -likedBy')
+        .select('-bodyHtml -toc -likedBy')
         .lean()
       const rankedArticles = rankArticlesByBm25(searchableArticles, search)
       const paginatedArticles = rankedArticles.slice(skip, skip + limit)
@@ -1673,7 +1879,6 @@ app.get(
           serializeArticle(article, {
             profileMap,
             viewerId: request.user?._id,
-            includeCoverImage: false,
             coverImageMaxCharacters: LIST_COVER_IMAGE_MAX_CHARACTERS,
           }),
         ),
@@ -1766,6 +1971,27 @@ app.get(
     await setCache(cacheKey, tags, 900)
 
     response.json({ tags })
+  }),
+)
+
+const coverImageUpload = createImageUploadMiddleware('covers')
+const articleImageUpload = createImageUploadMiddleware('articles')
+
+app.post(
+  '/api/uploads/cover',
+  requireAuth,
+  requireAuthor,
+  asyncHandler(async (request, response) => {
+    await handleImageUpload(request, response, coverImageUpload, 'cover')
+  }),
+)
+
+app.post(
+  '/api/uploads/article-image',
+  requireAuth,
+  requireAuthor,
+  asyncHandler(async (request, response) => {
+    await handleImageUpload(request, response, articleImageUpload, 'article')
   }),
 )
 
@@ -1945,6 +2171,7 @@ app.delete(
     await clearPendingPublicationRequestsForDraft(draft._id)
     await PublicationRequest.deleteMany({ draft: draft._id })
     await Draft.findByIdAndDelete(draft._id)
+    await deleteContentDocumentImages(draft)
 
     response.json({ message: 'Draft deleted successfully.' })
   }),
@@ -2078,45 +2305,58 @@ app.post(
       return
     }
 
-    const { bodyHtml, toc, readTime, plainText } = buildArticleContent(body)
-    const summary = buildSummary(request.body.summary || '', plainText)
-    const coverLabel = request.body.coverLabel?.trim() || domain.toUpperCase()
-    const coverImage = request.body.coverImage?.trim() || ''
-    const tags = normalizeTags(request.body.tags, domain)
-
-    ensureValidArticleInput({
+    const normalizedImages = await normalizeArticleImagesForStorage({
       title,
-      summary,
-      bodyHtml,
-      coverLabel,
-      coverImage,
-      tags,
-      domain,
+      coverImage: request.body.coverImage,
+      bodyHtml: body,
     })
 
-    const article = await Article.create({
-      author: request.user._id,
-      title,
-      slug: await createUniqueArticleSlug(title),
-      summary,
-      domain,
-      coverLabel,
-      coverImage,
-      tags,
-      bodyHtml,
-      toc,
-      publishedAt: new Date(),
-      readTime,
-      likedBy: [],
-      likeCount: 0,
-      commentCount: 0,
-      isDraft: false,
-      publicationRequested: false,
-      publicationRequestDate: null,
-      publicationStatus: 'published',
-      publicationNotes: '',
-      isFeatured: request.user.role === 'admin' ? Boolean(request.body.isFeatured) : false,
-    })
+    let article
+
+    try {
+      const { bodyHtml, toc, readTime, plainText } = buildArticleContent(normalizedImages.bodyHtml)
+      const summary = buildSummary(request.body.summary || '', plainText)
+      const coverLabel = request.body.coverLabel?.trim() || domain.toUpperCase()
+      const coverImage = normalizedImages.coverImage
+      const tags = normalizeTags(request.body.tags, domain)
+
+      ensureValidArticleInput({
+        title,
+        summary,
+        bodyHtml,
+        coverLabel,
+        coverImage,
+        tags,
+        domain,
+      })
+
+      article = await Article.create({
+        author: request.user._id,
+        title,
+        slug: await createUniqueArticleSlug(title),
+        summary,
+        domain,
+        coverLabel,
+        coverImage,
+        tags,
+        bodyHtml,
+        toc,
+        publishedAt: new Date(),
+        readTime,
+        likedBy: [],
+        likeCount: 0,
+        commentCount: 0,
+        isDraft: false,
+        publicationRequested: false,
+        publicationRequestDate: null,
+        publicationStatus: 'published',
+        publicationNotes: '',
+        isFeatured: request.user.role === 'admin' ? Boolean(request.body.isFeatured) : false,
+      })
+    } catch (error) {
+      await cleanupImages(normalizedImages.createdPaths)
+      throw error
+    }
 
     const createdArticle = await Article.findById(article._id).populate('author').lean()
     const profileMap = await buildProfileMap([request.user._id])
@@ -2250,31 +2490,46 @@ app.patch(
       return
     }
 
-    const { bodyHtml, toc, readTime, plainText } = buildArticleContent(bodyUpdate)
-    const summary = buildSummary(request.body.summary || '', plainText)
-    const coverLabel = request.body.coverLabel?.trim() || domainUpdate.toUpperCase()
-    const coverImage = request.body.coverImage?.trim() || ''
-    const tags = normalizeTags(request.body.tags, domainUpdate)
-
-    ensureValidArticleInput({
+    const previousImages = {
+      coverImage: article.coverImage,
+      bodyHtml: article.bodyHtml,
+    }
+    const normalizedImages = await normalizeArticleImagesForStorage({
       title: titleUpdate,
-      summary,
-      bodyHtml,
-      coverLabel,
-      coverImage,
-      domain: domainUpdate,
-      tags,
+      coverImage: request.body.coverImage,
+      bodyHtml: bodyUpdate,
     })
 
-    article.title = titleUpdate
-    article.summary = summary
-    article.domain = domainUpdate
-    article.coverLabel = coverLabel
-    article.coverImage = coverImage
-    article.tags = tags
-    article.bodyHtml = bodyHtml
-    article.toc = toc
-    article.readTime = readTime
+    try {
+      const { bodyHtml, toc, readTime, plainText } = buildArticleContent(normalizedImages.bodyHtml)
+      const summary = buildSummary(request.body.summary || '', plainText)
+      const coverLabel = request.body.coverLabel?.trim() || domainUpdate.toUpperCase()
+      const coverImage = normalizedImages.coverImage
+      const tags = normalizeTags(request.body.tags, domainUpdate)
+
+      ensureValidArticleInput({
+        title: titleUpdate,
+        summary,
+        bodyHtml,
+        coverLabel,
+        coverImage,
+        domain: domainUpdate,
+        tags,
+      })
+
+      article.title = titleUpdate
+      article.summary = summary
+      article.domain = domainUpdate
+      article.coverLabel = coverLabel
+      article.coverImage = coverImage
+      article.tags = tags
+      article.bodyHtml = bodyHtml
+      article.toc = toc
+      article.readTime = readTime
+    } catch (error) {
+      await cleanupImages(normalizedImages.createdPaths)
+      throw error
+    }
 
     if (request.body.saveAsDraft === true) {
       const shouldPreserveReviewNotes =
@@ -2300,7 +2555,14 @@ app.patch(
       shouldClearPendingRequests = true
     }
 
-    await article.save()
+    try {
+      await article.save()
+    } catch (error) {
+      await cleanupImages(normalizedImages.createdPaths)
+      throw error
+    }
+
+    await cleanupImages(getRemovedLocalImages(previousImages, article))
 
     if (shouldClearPendingRequests) {
       await clearPendingPublicationRequests(article._id)
@@ -2347,6 +2609,7 @@ app.delete(
     // Invalidate caches when article is deleted
     const domain = article.domain
     await Article.findByIdAndDelete(article._id)
+    await deleteContentDocumentImages(article)
     await invalidateOnArticleChange(article._id, domain)
 
     response.json({ message: 'Article deleted successfully.' })
@@ -3342,6 +3605,34 @@ app.use((error, request, response, next) => {
     })
     return
   }
+
+  if (error.name === 'MulterError') {
+    response.status(error.code === 'LIMIT_FILE_SIZE' ? 413 : 400).json({
+      message:
+        error.code === 'LIMIT_FILE_SIZE'
+          ? `Image must be ${formatBytes(ARTICLE_LIMITS.imageMaxBytes)} or smaller.`
+          : error.message || 'Image upload failed.',
+      error: {
+        code: error.code || 'UPLOAD_ERROR',
+        details: null,
+      },
+    })
+    return
+  }
+
+  if (
+    /Article images must be JPEG, PNG, or WebP files/i.test(error.message || '') ||
+    /Image file extension does not match its content type/i.test(error.message || '')
+  ) {
+    response.status(400).json({
+      message: error.message,
+      error: {
+        code: 'VALIDATION_ERROR',
+        details: null,
+      },
+    })
+    return
+  }
   
   // Handle Mongoose validation errors
   if (error.name === 'ValidationError') {
@@ -3393,6 +3684,7 @@ async function start() {
 
   // Initialize Redis cache
   await initializeRedis()
+  await ensureUploadDirectories()
 
   await mongoose.connect(process.env.MONGODB_URI)
   await ensureAdminAccount()

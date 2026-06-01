@@ -1,6 +1,7 @@
 const mongoose = require('mongoose')
 
 const Profile = require('../models/Profile')
+const { getImageUrl, rewriteStoredImagePathsToUrls } = require('../services/storage')
 const { toDisplayName } = require('./stringUtils')
 const { getProfileBatch, cacheProfileBatch } = require('./cacheService')
 
@@ -104,7 +105,7 @@ function serializeContentDocument(document, {
     summary: document.summary,
     domain: document.domain,
     coverLabel: document.coverLabel,
-    coverImage: serializedCoverImage,
+    coverImage: getImageUrl(serializedCoverImage),
     tags: document.tags || [],
     publishedAt: document.publishedAt || null,
     readTime: document.readTime,
@@ -126,7 +127,7 @@ function serializeContentDocument(document, {
   }
 
   if (includeBody) {
-    serialized.bodyHtml = document.bodyHtml
+    serialized.bodyHtml = rewriteStoredImagePathsToUrls(document.bodyHtml)
   }
 
   return serialized
