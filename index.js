@@ -40,6 +40,7 @@ const {
   collectImagePathsFromHtml,
   convertDataUrlImagesInHtml,
   createImageUploadMiddleware,
+  createS3UploadHandler,
   deleteImage,
   deleteImagesFromHtml,
   ensureUploadDirectories,
@@ -51,6 +52,7 @@ const {
   rewriteImageUrlsToStoredPaths,
   saveDataUrlImage,
   validateStoredImageFile,
+  useS3,
 } = require('./services/storage')
 const { buildArticleContent, buildSummary, stripBase64Images } = require('./utils/articleUtils')
 const { sendEmail, sendOtpEmail, sendWriterAccessGrantedEmail, sendWriterAccessRevokedEmail } = require('./utils/mail')
@@ -704,35 +706,52 @@ async function deleteContentDocumentImages(document) {
 }
 
 async function handleImageUpload(request, response, uploadMiddleware, kind) {
-  await new Promise((resolve, reject) => {
-    uploadMiddleware.single('image')(request, response, (error) => {
-      if (error) {
-        reject(error)
-        return
-      }
+  if (uploadMiddleware) {
+    await new Promise((resolve, reject) => {
+      uploadMiddleware.single('image')(request, response, (error) => {
+        if (error) {
+          reject(error)
+          return
+        }
 
-      resolve()
+        resolve()
+      })
     })
-  })
+  }
 
   ensure(request.file, 'Image file is required.', 400, 'VALIDATION_ERROR')
 
-  try {
-    await validateStoredImageFile(request.file.path, request.file.mimetype)
-  } catch (error) {
-    await deleteImage(getPublicPathFromAbsolutePath(request.file.path))
-    throw new AppError(400, error.message, { code: 'VALIDATION_ERROR' })
+  // For S3 uploads, file.path is already the S3 URL (set by S3 handler middleware)
+  // For local uploads, file.path is the local file path
+  const imagePath = request.file.path
+
+  // If it's a local path, validate and get public path
+  if (!imagePath.startsWith('http')) {
+    try {
+      await validateStoredImageFile(imagePath, request.file.mimetype)
+    } catch (error) {
+      await deleteImage(imagePath)
+      throw new AppError(400, error.message, { code: 'VALIDATION_ERROR' })
+    }
+    
+    const publicPath = getPublicPathFromAbsolutePath(imagePath)
+    response.status(201).json({
+      image: {
+        path: publicPath,
+        url: getImageUrl(publicPath),
+        kind,
+      },
+    })
+  } else {
+    // For S3 URLs, return directly
+    response.status(201).json({
+      image: {
+        path: imagePath,
+        url: imagePath,
+        kind,
+      },
+    })
   }
-
-  const imagePath = getPublicPathFromAbsolutePath(request.file.path)
-
-  response.status(201).json({
-    image: {
-      path: imagePath,
-      url: getImageUrl(imagePath),
-      kind,
-    },
-  })
 }
 
 function validateCommentInput(body) {
@@ -1977,12 +1996,28 @@ app.get(
 const coverImageUpload = createImageUploadMiddleware('covers')
 const articleImageUpload = createImageUploadMiddleware('articles')
 
+// S3 upload handlers (only active when USE_S3 is true)
+const handleCoverS3Upload = createS3UploadHandler('covers')
+const handleArticleS3Upload = createS3UploadHandler('articles')
+
+// Create middleware chain for S3 uploads
+function createImageUploadChain(uploadMiddleware, s3Handler) {
+  return [
+    uploadMiddleware.single('image'),
+    s3Handler,
+  ]
+}
+
+const coverUploadChain = useS3 ? createImageUploadChain(coverImageUpload, handleCoverS3Upload) : [coverImageUpload.single('image')]
+const articleUploadChain = useS3 ? createImageUploadChain(articleImageUpload, handleArticleS3Upload) : [articleImageUpload.single('image')]
+
 app.post(
   '/api/uploads/cover',
   requireAuth,
   requireAuthor,
+  ...coverUploadChain,
   asyncHandler(async (request, response) => {
-    await handleImageUpload(request, response, coverImageUpload, 'cover')
+    await handleImageUpload(request, response, null, 'cover')
   }),
 )
 
@@ -1990,8 +2025,9 @@ app.post(
   '/api/uploads/article-image',
   requireAuth,
   requireAuthor,
+  ...articleUploadChain,
   asyncHandler(async (request, response) => {
-    await handleImageUpload(request, response, articleImageUpload, 'article')
+    await handleImageUpload(request, response, null, 'article')
   }),
 )
 
